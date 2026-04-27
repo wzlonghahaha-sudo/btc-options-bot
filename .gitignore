@@ -1,0 +1,19 @@
+# 敏感文件 - 绝对不能上传
+.env
+*.env
+
+# 运行时文件
+bot.log
+bot.pid
+iv_history.json
+charts/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 其他项目
+opencode-telegram-bot/
+opencode-telegram-bot.env
+agents.md
