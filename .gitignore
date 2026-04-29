@@ -17,3 +17,4 @@ __pycache__/
 opencode-telegram-bot/
 opencode-telegram-bot.env
 agents.md
+*.docx

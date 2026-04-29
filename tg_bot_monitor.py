@@ -51,7 +51,11 @@ from otm_put_monitor import (
     calc_odds_score,
 )
 from risk_monitor import RiskEngine, RiskAlert, format_risk_alerts, format_risk_summary
-from profit_optimizer import analyze_position_optimization, format_profit_report
+from profit_optimizer import analyze_position_optimization, format_profit_report, VolatilityAnalyzer
+from opportunity_scanner import (
+    scan_all_opportunities, assess_account_risk,
+    format_opportunities_tg, format_signal_push, ScanConfig,
+)
 
 load_dotenv()
 
@@ -352,7 +356,7 @@ class MessageFormatter:
             "/profit - 💰 止盈/Roll/HV分析\n"
             "/risk - 🛡️ 风控报告\n"
             "/iv - 查看 IV 曲面\n"
-            "/top - 查看当前 Top 机会\n"
+            "/top - 🔍 机会扫描 (三档分层+风控)\n"
             "/overview - 发送完整市场概览\n"
             "/strategy - 📖 策略说明 (小白版)\n"
             "/rules - 📏 具体入场/风控规则\n"
@@ -559,6 +563,7 @@ class MonitorService:
         self.iv_tracker = IVTracker()
         self.cooldown = CooldownManager()
         self.risk_engine = RiskEngine()
+        self.vol_analyzer = VolatilityAnalyzer()
         self.fmt = MessageFormatter()
 
         self.scan_count = 0
@@ -622,6 +627,17 @@ class MonitorService:
             except Exception as e:
                 log.error(f"收益优化分析失败: {e}")
 
+        # v2 机会扫描 (每次都做, 用于信号推送)
+        v2_opportunities = []
+        account_risk = None
+        hv_20 = 0
+        try:
+            account_risk = assess_account_risk(self.api, data)
+            hv_20 = self.vol_analyzer.calc_hv(20)
+            v2_opportunities = scan_all_opportunities(data, iv_surface, account_risk, hv_20)
+        except Exception as e:
+            log.error(f"v2机会扫描失败: {e}")
+
         scan_time = time.time() - t0
         self.scan_count += 1
         self.last_scan_time = scan_time
@@ -645,6 +661,9 @@ class MonitorService:
             "order_alerts": order_alerts,
             "risk_alerts": risk_alerts,
             "profit_analysis": profit_analysis,
+            "v2_opportunities": v2_opportunities,
+            "account_risk": account_risk,
+            "hv_20": hv_20,
             "scan_time": scan_time,
         }
         self.last_result = result
@@ -697,6 +716,37 @@ class MonitorService:
                  f"(C:{len([a for a in pushable if a.level=='CRITICAL'])} "
                  f"D:{len([a for a in pushable if a.level=='DANGER'])} "
                  f"W:{len([a for a in pushable if a.level=='WARNING'])})")
+
+    def process_v2_signals(self, result: dict):
+        """处理 v2 机会扫描的信号推送"""
+        opps = result.get("v2_opportunities", [])
+        account = result.get("account_risk")
+        if not opps or not account:
+            return
+
+        msg = format_signal_push(opps, account)
+        if not msg:
+            return
+
+        # 去重: 检查是否有新的可推送信号
+        pushable = [o for o in opps if o.score >= ScanConfig.SCORE_SIGNAL and o.can_open]
+        new_signals = []
+        for o in pushable:
+            key = f"v2sig:{o.symbol}"
+            now = time.time()
+            last = self.cooldown.signal_sent.get(key, {}).get("time", 0)
+            if now - last > 3600:  # 1小时去重
+                new_signals.append(o)
+                self.cooldown.signal_sent[key] = {"signal": o.tier, "time": now}
+
+        if not new_signals:
+            return
+
+        self.tg.send(msg)
+        log.info(f"推送 v2 信号: {len(new_signals)} 个 "
+                 f"(保守:{len([o for o in new_signals if o.tier=='conservative'])} "
+                 f"均衡:{len([o for o in new_signals if o.tier=='balanced'])} "
+                 f"激进:{len([o for o in new_signals if o.tier=='aggressive'])})")
 
     def process_profit_advice(self, profit_analysis: dict):
         """处理止盈/Roll建议推送"""
@@ -907,21 +957,13 @@ class MonitorService:
 
             elif text == "/top":
                 if self.last_result:
-                    results = self.last_result["results"]
-                    top = results[:10]
-                    if top:
-                        spot = self.last_result["data"]["spot"]
-                        lines = [f"🏆 <b>Top 10 机会</b>  BTC ${spot:,.0f}\n"]
-                        for i, r in enumerate(top, 1):
-                            icon = {"STRONG": "🔴", "SIGNAL": "🟡", "WATCH": "👀"}.get(r["signal"], "⚪")
-                            lines.append(
-                                f"{icon} <b>#{i} {r['symbol']}</b>\n"
-                                f"  赔率 {r['odds_score']:.1f}  "
-                                f"Bid ${r['bid']:,.0f}  年化 {r['annual_return']:.0f}%  "
-                                f"安全垫 {r['safety_pct']:.0f}%  "
-                                f"IV溢 {r['iv_premium']:+.0f}%\n"
-                            )
-                        self.tg.send("\n".join(lines))
+                    opps = self.last_result.get("v2_opportunities", [])
+                    account = self.last_result.get("account_risk")
+                    hv = self.last_result.get("hv_20", 0)
+                    iv_mean = self.last_result["iv_surface"]["global"]["mean"]
+                    if opps and account:
+                        msg = format_opportunities_tg(opps, account, hv, iv_mean)
+                        self.tg.send(msg)
                     else:
                         self.tg.send("当前无符合条件的机会")
                 else:
@@ -957,6 +999,7 @@ class MonitorService:
             self.process_pos_alerts(result["pos_alerts"])
             self.process_risk_alerts(result.get("risk_alerts", []))
             self.process_profit_advice(result.get("profit_analysis"))
+            self.process_v2_signals(result)
         except Exception as e:
             log.error(f"首次扫描失败: {e}")
             self.tg.send(f"❌ 首次扫描失败: {e}")
@@ -992,6 +1035,9 @@ class MonitorService:
                 # 处理止盈建议
                 if result.get("profit_analysis"):
                     self.process_profit_advice(result["profit_analysis"])
+
+                # v2 机会信号
+                self.process_v2_signals(result)
 
                 # 定期概览
                 if time.time() - self.last_overview_time > OVERVIEW_INTERVAL:
