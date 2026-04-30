@@ -13,8 +13,26 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 其他项目
+# 运行时 - watchdog
+watchdog.log
+watchdog.pid
+
+# 其他项目和无关文件
 opencode-telegram-bot/
+opencode-whatsapp-bridge/
 opencode-telegram-bot.env
 agents.md
 *.docx
+*.html
+*.json
+!.env.example
+!package.json
+credentials*.json
+token.json
+oauth_state.json
+create_doc.py
+create_beautiful_doc.py
+exchange_token.py
+gen_auth_url.py
+google_auth*.py
+broker_strategy_report*
