@@ -58,8 +58,9 @@ class ScanConfig:
     MAX_SPREAD_PCT = 15.0
 
     # 评分标准 (更宽松, 展示更多)
-    SCORE_SIGNAL = 55     # 推送门槛
+    SCORE_SIGNAL = 55     # 可入场门槛 (命令查看)
     SCORE_STRONG = 75     # 强信号
+    SCORE_PUSH = 78       # 自动推送门槛 (78+才主动推送详情)
 
     # 账户风控
     MARGIN_RATE = 0.15
@@ -274,18 +275,22 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         theta_daily_pct = abs(theta) / mark_price * 100 if mark_price > 0 else 0
         iv_hv_ratio = iv / hv_20 if hv_20 > 0 else 0
 
-        # === 评分 (更宽松, 更均衡) ===
-        # 年化评分: 20%满分, 50%很好, 80%极好
-        if annual_return >= 60:
-            ret_score = 100
-        elif annual_return >= 30:
-            ret_score = 40 + (annual_return - 30) / 30 * 60
-        elif annual_return >= 10:
-            ret_score = (annual_return - 10) / 20 * 40
-        else:
-            ret_score = 0
+        # === 评分 (Sinclair 风险溢价框架) ===
+        #
+        # 核心理念 (Euan Sinclair):
+        #   - 卖方的 Edge 来自 variance premium (IV > HV), 不是 theta 衰减
+        #   - theta 不是免费午餐, 它只是风险溢价的会计表达
+        #   - 你被付费是因为承担了不愉快的风险 (尾部亏损)
+        #   - 安全垫 = 风险管理, variance premium = Edge 来源
+        #
+        # 权重设计:
+        #   安全垫      30% — 风控第一, 决定你能否活下来
+        #   风险溢价    30% — Edge的真正来源 (IV溢价 + IV/HV综合)
+        #   年化收益    20% — 收益要看, 但高收益≠高质量
+        #   流动性      10% — 能以合理价格成交
+        #   时间结构    10% — DTE甜蜜区 + theta效率 (辅助, 非核心)
 
-        # 安全垫评分
+        # 1. 安全垫评分 (30%) — 风控基础
         t_safety_min = tier_cfg["otm_min"]
         if safety_pct >= t_safety_min + 20:
             safe_score = 100
@@ -296,27 +301,46 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         else:
             safe_score = 0
 
-        # IV溢价评分
+        # 2. 风险溢价评分 (30%) — Edge 的核心来源
+        #    综合 IV溢价 和 IV/HV比值, 反映 variance premium 的厚度
+        #    "如果期权不贵, 就没有卖的理由" — Sinclair
+
+        # 2a. IV溢价子分 (占风险溢价的60%)
         if iv_premium >= 40:
-            iv_score = 100
+            iv_sub = 100
         elif iv_premium >= 20:
-            iv_score = 40 + (iv_premium - 20) / 20 * 60
+            iv_sub = 40 + (iv_premium - 20) / 20 * 60
         elif iv_premium >= 5:
-            iv_score = (iv_premium - 5) / 15 * 40
+            iv_sub = (iv_premium - 5) / 15 * 40
         else:
-            iv_score = 0
+            iv_sub = 0
 
-        # IV/HV 加成
+        # 2b. IV/HV 比值子分 (占风险溢价的40%)
+        #     IV/HV > 1 意味着市场定价的波动率高于实际波动率 = 卖方有优势
         if iv_hv_ratio >= 1.5:
-            hv_bonus = 15
-        elif iv_hv_ratio >= 1.25:
-            hv_bonus = 8
+            ivhv_sub = 100
+        elif iv_hv_ratio >= 1.3:
+            ivhv_sub = 60 + (iv_hv_ratio - 1.3) / 0.2 * 40
         elif iv_hv_ratio >= 1.1:
-            hv_bonus = 3
+            ivhv_sub = 20 + (iv_hv_ratio - 1.1) / 0.2 * 40
+        elif iv_hv_ratio >= 1.0:
+            ivhv_sub = (iv_hv_ratio - 1.0) / 0.1 * 20
         else:
-            hv_bonus = 0
+            ivhv_sub = 0  # IV < HV: 卖方无优势
 
-        # 流动性评分
+        vp_score = iv_sub * 0.60 + ivhv_sub * 0.40
+
+        # 3. 年化收益评分 (20%)
+        if annual_return >= 60:
+            ret_score = 100
+        elif annual_return >= 30:
+            ret_score = 40 + (annual_return - 30) / 30 * 60
+        elif annual_return >= 10:
+            ret_score = (annual_return - 10) / 20 * 40
+        else:
+            ret_score = 0
+
+        # 4. 流动性评分 (10%)
         if spread_pct <= 2:
             liq_score = 100
         elif spread_pct <= 5:
@@ -327,14 +351,29 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
             liq_score = 0
         liq_score = min(liq_score + min(volume / 10, 10), 100)
 
-        # 综合评分
+        # 5. 时间结构评分 (10%) — DTE甜蜜区 + theta效率
+        #    14-45天: theta衰减加速但gamma风险可控
+        #    theta本身不是edge, 但合理的时间窗口提升资金效率
+        theta_score = min(theta_daily_pct / 5 * 100, 100) * 0.5  # theta效率 (占50%)
+        if 14 <= dte <= 45:
+            dte_sub = 100
+        elif 7 <= dte < 14:
+            dte_sub = 30 + (dte - 7) / 7 * 70   # 7天=30, 14天=100
+        elif 45 < dte <= 60:
+            dte_sub = 60 + (60 - dte) / 15 * 40  # 45天=100, 60天=60
+        elif 60 < dte <= 90:
+            dte_sub = 30 + (90 - dte) / 30 * 30   # 60天=60, 90天=30
+        else:
+            dte_sub = max(0, 20)  # >90天: 基础分20
+        time_score = theta_score + dte_sub * 0.5  # DTE甜蜜区 (占50%)
+
+        # === 综合评分 ===
         score = (
-            safe_score * 0.30
-            + ret_score * 0.25
-            + iv_score * 0.20
-            + liq_score * 0.15
-            + min(theta_daily_pct / 5 * 100, 100) * 0.10
-            + hv_bonus
+            safe_score * 0.30     # 安全垫: 活下来
+            + vp_score * 0.30     # 风险溢价: Edge来源
+            + ret_score * 0.20    # 年化收益: 回报合理性
+            + liq_score * 0.10    # 流动性: 能成交
+            + time_score * 0.10   # 时间结构: 资金效率
         )
 
         # === 账户风控评估 ===
@@ -389,19 +428,15 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         elif annual_return < 10:
             cons.append(f"年化收益偏低 {annual_return:.0f}%")
 
-        if iv_premium >= 30:
-            pros.append(f"IV溢价高 +{iv_premium:.0f}% (期权偏贵)")
-        elif iv_premium >= 15:
-            pros.append(f"IV有一定溢价 +{iv_premium:.0f}%")
-        elif iv_premium < 5:
-            cons.append(f"IV溢价低 +{iv_premium:.0f}% (期权不贵)")
-
-        if iv_hv_ratio >= 1.3:
-            pros.append(f"IV/HV={iv_hv_ratio:.1f}x 卖方优势明显")
-        elif iv_hv_ratio >= 1.1:
-            pros.append(f"IV/HV={iv_hv_ratio:.1f}x 卖方有优势")
-        elif iv_hv_ratio > 0:
-            cons.append(f"IV/HV={iv_hv_ratio:.1f}x 卖方优势弱")
+        # 风险溢价 (variance premium) 综合评判
+        if iv_premium >= 30 and iv_hv_ratio >= 1.3:
+            pros.append(f"风险溢价厚 IV溢价+{iv_premium:.0f}% IV/HV={iv_hv_ratio:.1f}x")
+        elif iv_premium >= 20 or iv_hv_ratio >= 1.3:
+            pros.append(f"风险溢价良好 IV溢价+{iv_premium:.0f}% IV/HV={iv_hv_ratio:.1f}x")
+        elif iv_premium >= 10 or iv_hv_ratio >= 1.1:
+            pros.append(f"风险溢价一般 IV溢价+{iv_premium:.0f}% IV/HV={iv_hv_ratio:.1f}x")
+        else:
+            cons.append(f"风险溢价薄 IV溢价+{iv_premium:.0f}% IV/HV={iv_hv_ratio:.1f}x (卖方Edge弱)")
 
         if spread_pct <= 2:
             pros.append(f"流动性好 spread {spread_pct:.1f}%")
@@ -550,34 +585,48 @@ def _format_one_opportunity(lines: list, o: Opportunity, brief: bool):
 
 
 def format_signal_push(opps: list, account: AccountRisk) -> str:
-    """格式化自动推送的信号消息"""
-    cfg = ScanConfig()
-    pushable = [o for o in opps if o.score >= cfg.SCORE_SIGNAL and o.can_open]
+    """
+    格式化自动推送的信号消息
 
-    if not pushable:
+    策略:
+    - 78+分: 完整详情推送
+    - <78分: 不推送 (用户通过 /top 命令自行查看)
+    """
+    cfg = ScanConfig()
+    top_opps = [o for o in opps if o.score >= cfg.SCORE_PUSH and o.can_open]
+
+    if not top_opps:
         return ""
 
-    lines = ["🔔 <b>新入场机会</b>", ""]
-
+    lines = []
+    lines.append("🔔 <b>新入场机会</b>")
+    lines.append("")
     lines.append(f"账户可用: ${account.available_margin:,.0f}  "
                  f"组合Delta: {account.portfolio_delta:.3f}")
     lines.append("")
 
-    for o in pushable[:5]:
-        if o.score >= cfg.SCORE_STRONG:
+    for o in top_opps[:5]:
+        if o.score >= 90:
+            sig = "🔥🔥 极强信号"
+        elif o.score >= 78:
             sig = "🔥 强信号"
         else:
             sig = "⭐ 可入场"
 
         lines.append(f"<b>{sig} {o.tier_label}</b>")
-        lines.append(f"<b>{o.symbol}</b>  评分 {o.score:.0f}")
-        lines.append(f"  Bid ${o.bid:,.0f}  年化 {o.annual_return:.0f}%  安全垫 {o.safety_pct:.0f}%")
-        lines.append(f"  Delta {o.delta:.4f}  IV溢价 {o.iv_premium:+.0f}%  到期 {o.dte:.0f}天")
+        lines.append(f"<b>{o.symbol}</b>  评分 <b>{o.score:.0f}</b>")
+        lines.append(f"  Bid <b>${o.bid:,.0f}</b>  |  年化 <b>{o.annual_return:.0f}%</b>  |  安全垫 {o.safety_pct:.0f}%")
+        lines.append(f"  Delta {o.delta:.4f}  |  IV溢价 {o.iv_premium:+.0f}%  |  到期 {o.dte:.0f}天")
         if o.pros:
             lines.append(f"  ✅ {' / '.join(o.pros[:3])}")
         if o.cons:
             lines.append(f"  ⚠️ {' / '.join(o.cons[:2])}")
-        lines.append(f"  保证金 ${o.margin_required:,.0f}  开仓后Delta {o.new_portfolio_delta:.3f}")
+        lines.append(f"  保证金 ${o.margin_required:,.0f}  |  开仓后Delta {o.new_portfolio_delta:.3f}")
         lines.append("")
+
+    # 底部提示还有更多低分机会
+    other_count = len([o for o in opps if cfg.SCORE_SIGNAL <= o.score < cfg.SCORE_PUSH and o.can_open])
+    if other_count > 0:
+        lines.append(f"另有 {other_count} 个低分机会 → /top 查看全部")
 
     return "\n".join(lines)

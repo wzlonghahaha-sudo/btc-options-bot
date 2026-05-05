@@ -99,7 +99,32 @@ class TelegramBot:
         self.session = requests.Session()
 
     def send(self, text: str, parse_mode: str = "HTML", silent: bool = False) -> bool:
-        """发送消息"""
+        """发送消息，自动分片处理超长消息（TG限制4096字符）"""
+        MAX_LEN = 4000  # 留一点余量
+        if len(text) <= MAX_LEN:
+            return self._send_one(text, parse_mode, silent)
+
+        # 按换行符分片，尽量不截断段落
+        chunks = []
+        current = ""
+        for line in text.split("\n"):
+            if len(current) + len(line) + 1 > MAX_LEN:
+                if current:
+                    chunks.append(current)
+                current = line
+            else:
+                current = current + "\n" + line if current else line
+        if current:
+            chunks.append(current)
+
+        ok = True
+        for i, chunk in enumerate(chunks):
+            if not self._send_one(chunk, parse_mode, silent):
+                ok = False
+        return ok
+
+    def _send_one(self, text: str, parse_mode: str = "HTML", silent: bool = False) -> bool:
+        """发送单条消息"""
         try:
             resp = self.session.post(
                 f"{self.api_base}/sendMessage",
@@ -356,13 +381,16 @@ class MessageFormatter:
             "/profit - 💰 止盈/Roll/HV分析\n"
             "/risk - 🛡️ 风控报告\n"
             "/iv - 查看 IV 曲面\n"
-            "/top - 🔍 机会扫描 (三档分层+风控)\n"
+            "/top - 🔍 全部机会 (三档分层+风控)\n"
+            "/top80 - 🔥 仅看80+高分机会\n"
+            "/top70 - ⭐ 看70+以上机会\n"
             "/overview - 发送完整市场概览\n"
             "/strategy - 📖 策略说明 (小白版)\n"
             "/rules - 📏 具体入场/风控规则\n"
             "/help - 显示此帮助\n\n"
             "<b>自动推送:</b>\n"
-            "• 新信号 / 信号升级: 即时推送\n"
+            "• 80+高分机会: 即时详情推送 (1h去重)\n"
+            "• 55-79普通机会: 轻量提示 (4h去重)\n"
             "• 持仓预警: 即时推送\n"
             "• 市场概览: 每4小时\n"
             "• 扫描间隔: 常规3分钟, 波动时1分钟"
@@ -460,28 +488,32 @@ class MessageFormatter:
             "  → 期权定价必须偏贵\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>📊 赔率评分 (满分100)</b>\n\n"
+            "<b>📊 评分模型 (Sinclair风险溢价框架)</b>\n\n"
+            "核心理念: Edge来自variance premium\n"
+            "(IV&gt;HV), 不是theta衰减\n\n"
             "五个维度加权打分：\n"
-            "• 安全垫 (35%权重)\n"
-            "  25%起步, 35%不错, 45%+满分\n"
-            "• IV溢价 (25%权重)\n"
-            "  20%起步, 35%不错, 60%+满分\n"
-            "• 年化收益 (20%权重)\n"
-            "  30%起步, 50%不错, 80%+满分\n"
-            "• 流动性 (12%权重)\n"
-            "  Spread+成交量+持仓量\n"
-            "• Theta效率 (8%权重)\n"
-            "  每天吃掉多少权利金\n\n"
+            "• 安全垫 (30%权重) — 活下来\n"
+            "  距行权价的安全距离\n"
+            "• 风险溢价 (30%权重) — Edge来源\n"
+            "  IV溢价(60%) + IV/HV比值(40%)\n"
+            "  期权越贵、IV越高于HV, 分越高\n"
+            "• 年化收益 (20%权重) — 回报合理性\n"
+            "  10%起步, 30%不错, 60%+满分\n"
+            "• 流动性 (10%权重) — 能成交\n"
+            "  Spread+成交量\n"
+            "• 时间结构 (10%权重) — 资金效率\n"
+            "  14-45天甜蜜区 + theta效率\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>🚦 信号等级</b>\n\n"
-            "• ⚪ WAIT (&lt;60分) → 不推送, 继续等\n"
-            "• 👀 WATCH (60-74分) → 关注, 不推送\n"
-            "• 🟡 SIGNAL (75-87分) → <b>推送通知</b>\n"
-            "• 🔴 STRONG (88分+) → <b>强烈推送</b>\n\n"
-            "大部分时间都是 WAIT/WATCH\n"
-            "SIGNAL 可能几天出现一次\n"
-            "STRONG 可能几周才出现一次\n\n"
+            "• ⚪ WAIT (&lt;55分) → 不推送, 继续等\n"
+            "• 👀 WATCH (55-79分) → 轻量提示 (4h一次)\n"
+            "  └ /top 查看详情\n"
+            "• 🔥 STRONG (80分+) → <b>完整详情推送</b> (1h去重)\n"
+            "• 🔥🔥 ELITE (90分+) → <b>极强信号推送</b>\n\n"
+            "大部分时间都是安静的\n"
+            "80+机会可能几天出现一次\n"
+            "90+极强信号非常罕见\n\n"
 
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>🛡️ 持仓风控</b>\n\n"
@@ -718,35 +750,41 @@ class MonitorService:
                  f"W:{len([a for a in pushable if a.level=='WARNING'])})")
 
     def process_v2_signals(self, result: dict):
-        """处理 v2 机会扫描的信号推送"""
+        """处理 v2 机会扫描的信号推送
+
+        推送策略:
+        - 78+分: 主动推送完整详情
+        - <78分: 不推送, 用户通过 /top 自行查看
+        - 去重: 1小时内同一合约不重复推送
+        """
         opps = result.get("v2_opportunities", [])
         account = result.get("account_risk")
         if not opps or not account:
             return
 
-        msg = format_signal_push(opps, account)
-        if not msg:
+        now = time.time()
+
+        # 只关注78+机会
+        top_opps = [o for o in opps if o.score >= ScanConfig.SCORE_PUSH and o.can_open]
+        if not top_opps:
             return
 
-        # 去重: 检查是否有新的可推送信号
-        pushable = [o for o in opps if o.score >= ScanConfig.SCORE_SIGNAL and o.can_open]
-        new_signals = []
-        for o in pushable:
-            key = f"v2sig:{o.symbol}"
-            now = time.time()
+        # 去重: 1小时内同一合约不重复推送
+        new_top = []
+        for o in top_opps:
+            key = f"v2top:{o.symbol}"
             last = self.cooldown.signal_sent.get(key, {}).get("time", 0)
-            if now - last > 3600:  # 1小时去重
-                new_signals.append(o)
+            if now - last > 3600:
+                new_top.append(o)
                 self.cooldown.signal_sent[key] = {"signal": o.tier, "time": now}
 
-        if not new_signals:
+        if not new_top:
             return
 
-        self.tg.send(msg)
-        log.info(f"推送 v2 信号: {len(new_signals)} 个 "
-                 f"(保守:{len([o for o in new_signals if o.tier=='conservative'])} "
-                 f"均衡:{len([o for o in new_signals if o.tier=='balanced'])} "
-                 f"激进:{len([o for o in new_signals if o.tier=='aggressive'])})")
+        msg = format_signal_push(opps, account)
+        if msg:
+            self.tg.send(msg)
+            log.info(f"推送 v2 信号: {len(new_top)} 个 (78+分)")
 
     def process_profit_advice(self, profit_analysis: dict):
         """处理止盈/Roll建议推送"""
@@ -955,15 +993,30 @@ class MonitorService:
                 else:
                     self.tg.send("⏳ 尚未完成首次扫描")
 
-            elif text == "/top":
+            elif text == "/top" or text.startswith("/top"):
                 if self.last_result:
                     opps = self.last_result.get("v2_opportunities", [])
                     account = self.last_result.get("account_risk")
                     hv = self.last_result.get("hv_20", 0)
                     iv_mean = self.last_result["iv_surface"]["global"]["mean"]
                     if opps and account:
-                        msg = format_opportunities_tg(opps, account, hv, iv_mean)
-                        self.tg.send(msg)
+                        # 解析筛选分数: /top80, /top70 等
+                        min_score = 0
+                        cmd_num = text[4:]  # 去掉 "/top"
+                        if cmd_num.isdigit():
+                            min_score = int(cmd_num)
+                        
+                        if min_score > 0:
+                            filtered = [o for o in opps if o.score >= min_score]
+                            if filtered:
+                                msg = format_opportunities_tg(filtered, account, hv, iv_mean)
+                                header = f"🔍 <b>评分 ≥{min_score} 的机会 ({len(filtered)}个)</b>\n\n"
+                                self.tg.send(header + msg)
+                            else:
+                                self.tg.send(f"当前无评分 ≥{min_score} 的机会\n\n👉 /top 查看全部")
+                        else:
+                            msg = format_opportunities_tg(opps, account, hv, iv_mean)
+                            self.tg.send(msg)
                     else:
                         self.tg.send("当前无符合条件的机会")
                 else:
