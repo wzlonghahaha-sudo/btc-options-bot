@@ -64,6 +64,8 @@ load_dotenv()
 # ============================================================
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+# 额外推送群组 (逗号分隔多个)
+TG_GROUP_IDS = [g.strip() for g in os.getenv("TG_GROUP_IDS", "").split(",") if g.strip()]
 
 # 扫描间隔
 SCAN_INTERVAL_NORMAL = 180       # 常规: 3分钟
@@ -178,6 +180,80 @@ class TelegramBot:
             return data.get("result", [])
         except Exception:
             return []
+
+    def _send_to(self, chat_id: str, text: str, parse_mode: str = "HTML", silent: bool = False) -> bool:
+        """发送消息到指定 chat_id"""
+        try:
+            resp = self.session.post(
+                f"{self.api_base}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                    "disable_notification": silent,
+                },
+                timeout=10,
+            )
+            if not resp.json().get("ok"):
+                log.error(f"TG send to {chat_id} failed: {resp.text[:200]}")
+                return False
+            return True
+        except Exception as e:
+            log.error(f"TG send to {chat_id} error: {e}")
+            return False
+
+    def _send_photo_to(self, chat_id: str, photo_path: str, caption: str = "", parse_mode: str = "HTML") -> bool:
+        """发送图片到指定 chat_id"""
+        try:
+            with open(photo_path, "rb") as f:
+                resp = self.session.post(
+                    f"{self.api_base}/sendPhoto",
+                    data={
+                        "chat_id": chat_id,
+                        "caption": caption,
+                        "parse_mode": parse_mode,
+                    },
+                    files={"photo": f},
+                    timeout=15,
+                )
+            if not resp.json().get("ok"):
+                log.error(f"TG photo to {chat_id} failed: {resp.text[:200]}")
+                return False
+            return True
+        except Exception as e:
+            log.error(f"TG photo to {chat_id} error: {e}")
+            return False
+
+    def broadcast(self, text: str, parse_mode: str = "HTML", silent: bool = False):
+        """广播消息: 发到主 chat + 所有群组"""
+        # 发到主 chat (自己)
+        self.send(text, parse_mode, silent)
+        # 发到所有群组
+        for group_id in TG_GROUP_IDS:
+            # 超长分片
+            MAX_LEN = 4000
+            if len(text) <= MAX_LEN:
+                self._send_to(group_id, text, parse_mode, silent)
+            else:
+                chunks = []
+                current = ""
+                for line in text.split("\n"):
+                    if len(current) + len(line) + 1 > MAX_LEN:
+                        if current:
+                            chunks.append(current)
+                        current = line
+                    else:
+                        current = current + "\n" + line if current else line
+                if current:
+                    chunks.append(current)
+                for chunk in chunks:
+                    self._send_to(group_id, chunk, parse_mode, silent)
+
+    def broadcast_photo(self, photo_path: str, caption: str = "", parse_mode: str = "HTML"):
+        """广播图片: 发到主 chat + 所有群组"""
+        self.send_photo(photo_path, caption, parse_mode)
+        for group_id in TG_GROUP_IDS:
+            self._send_photo_to(group_id, photo_path, caption, parse_mode)
 
 
 # ============================================================
@@ -715,7 +791,7 @@ class MonitorService:
 
         if to_send:
             msg = self.fmt.signal_alert(to_send, spot)
-            self.tg.send(msg)
+            self.tg.broadcast(msg)
             log.info(f"推送 {len(to_send)} 个信号")
 
     def process_pos_alerts(self, pos_alerts: list):
@@ -727,7 +803,7 @@ class MonitorService:
             sym = p.get("symbol", "")
             if self.cooldown.should_send_pos_alert(sym, alert):
                 msg = self.fmt.position_alert(p)
-                self.tg.send(msg, silent=(alert == "WARNING"))
+                self.tg.broadcast(msg, silent=(alert == "WARNING"))
                 self.cooldown.record_pos_alert(sym, alert)
                 log.info(f"推送持仓预警: {sym} [{alert}]")
 
@@ -743,7 +819,7 @@ class MonitorService:
         msg = format_risk_alerts(pushable)
         # CRITICAL 不静默
         silent = all(a.level == "WARNING" for a in pushable)
-        self.tg.send(msg, silent=silent)
+        self.tg.broadcast(msg, silent=silent)
         log.info(f"推送风控告警: {len(pushable)} 项 "
                  f"(C:{len([a for a in pushable if a.level=='CRITICAL'])} "
                  f"D:{len([a for a in pushable if a.level=='DANGER'])} "
@@ -783,7 +859,7 @@ class MonitorService:
 
         msg = format_signal_push(opps, account)
         if msg:
-            self.tg.send(msg)
+            self.tg.broadcast(msg)
             log.info(f"推送 v2 信号: {len(new_top)} 个 (78+分)")
 
     def process_profit_advice(self, profit_analysis: dict):
@@ -826,7 +902,7 @@ class MonitorService:
             if tp.roll_target:
                 msg_lines.append(f"\nRoll 目标: <b>{tp.roll_target}</b>")
 
-            self.tg.send("\n".join(msg_lines), silent=(tp.urgency != "HIGH"))
+            self.tg.broadcast("\n".join(msg_lines), silent=(tp.urgency != "HIGH"))
             log.info(f"推送止盈建议: {p['symbol']} → {tp.action} ({tp.urgency})")
 
     def send_overview(self, result: dict):
@@ -840,7 +916,7 @@ class MonitorService:
             order_alerts=result.get("order_alerts", []),
             risk_alerts=result.get("risk_alerts", []),
         )
-        self.tg.send(msg, silent=True)
+        self.tg.broadcast(msg, silent=True)
         self.last_overview_time = time.time()
         log.info("推送市场概览")
 
@@ -1117,7 +1193,7 @@ class MonitorService:
         log.info(f"概览间隔: {OVERVIEW_INTERVAL}s")
         log.info("=" * 60)
 
-        self.tg.send(
+        self.tg.broadcast(
             "🟢 <b>监控 Bot 已启动</b>\n\n"
             f"扫描间隔: {SCAN_INTERVAL_NORMAL}s (常规) / {SCAN_INTERVAL_VOLATILE}s (波动)\n"
             f"概览推送: 每{OVERVIEW_INTERVAL // 3600}小时\n\n"
@@ -1142,7 +1218,7 @@ class MonitorService:
             pass
 
         self.running = False
-        self.tg.send("🔴 <b>监控 Bot 已停止</b>")
+        self.tg.broadcast("🔴 <b>监控 Bot 已停止</b>")
         self.iv_tracker.save()
         log.info("Bot 已停止")
 
