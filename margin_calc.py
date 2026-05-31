@@ -63,19 +63,8 @@ def calc_margin_usage(mark_value: float, margin: float) -> float:
 #  Black-Scholes 定价
 # ============================================================
 def _norm_cdf(x: float) -> float:
-    """标准正态分布 CDF (近似, 精度 ~1e-7)"""
-    # Abramowitz & Stegun approximation
-    a1 = 0.254829592
-    a2 = -0.284496736
-    a3 = 1.421413741
-    a4 = -1.453152027
-    a5 = 1.061405429
-    p = 0.3275911
-    sign = 1 if x >= 0 else -1
-    x = abs(x)
-    t = 1.0 / (1.0 + p * x)
-    y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * math.exp(-x * x / 2)
-    return 0.5 * (1.0 + sign * y)
+    """标准正态分布 CDF (基于 math.erf, 精度 ~1e-15)"""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
 
 
 def bs_put_price(spot: float, strike: float, dte_days: float,
