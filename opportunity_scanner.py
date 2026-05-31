@@ -215,6 +215,33 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
     spot = data["spot"]
     now = datetime.now(timezone.utc)
 
+    # 计算每个到期日的 skew ratio (deep_otm_iv / atm_iv)
+    _skew_data = {}
+    for _sym, _m in data["marks"].items():
+        if "-P" not in _sym:
+            continue
+        _parts = _sym.split("-")
+        if len(_parts) < 4:
+            continue
+        _exp = _parts[1]
+        _strike = float(_parts[2])
+        _iv = float(_m.get("markIV", 0))
+        if _iv <= 0:
+            continue
+        _mon = (_strike / spot - 1) * 100
+        if _exp not in _skew_data:
+            _skew_data[_exp] = {"atm": [], "deep_otm": []}
+        if abs(_mon) < 5:
+            _skew_data[_exp]["atm"].append(_iv)
+        elif -40 < _mon < -20:
+            _skew_data[_exp]["deep_otm"].append(_iv)
+    _skew_ratios = {}
+    for _exp, _ivs in _skew_data.items():
+        if _ivs["atm"] and _ivs["deep_otm"]:
+            _skew_ratios[_exp] = (sum(_ivs["deep_otm"]) / len(_ivs["deep_otm"])) / (sum(_ivs["atm"]) / len(_ivs["atm"]))
+        else:
+            _skew_ratios[_exp] = 1.0
+
     results = []
 
     for sym, contract in data["contracts"].items():
@@ -274,6 +301,10 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         theta_daily_pct = abs(theta) / mark_price * 100 if mark_price > 0 else 0
         iv_hv_ratio = iv / hv_20 if hv_20 > 0 else 0
 
+        # 获取该到期日的 skew ratio
+        exp_key_for_skew = sym.split("-")[1] if "-" in sym else ""
+        skew_ratio = _skew_ratios.get(exp_key_for_skew, 1.0)
+
         # === 评分 (Sinclair 风险溢价框架) ===
         #
         # 核心理念 (Euan Sinclair):
@@ -281,13 +312,15 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         #   - theta 不是免费午餐, 它只是风险溢价的会计表达
         #   - 你被付费是因为承担了不愉快的风险 (尾部亏损)
         #   - 安全垫 = 风险管理, variance premium = Edge 来源
+        #   - 流动性是前提条件而非评分维度 (极差已被硬门槛过滤)
         #
         # 权重设计:
         #   安全垫      30% — 风控第一, 决定你能否活下来
         #   风险溢价    30% — Edge的真正来源 (IV溢价 + IV/HV综合)
         #   年化收益    20% — 收益要看, 但高收益≠高质量
-        #   流动性      10% — 能以合理价格成交
-        #   时间结构    10% — DTE甜蜜区 + theta效率 (辅助, 非核心)
+        #   Skew        10% — 深度OTM定价溢价, 越陡权利金越厚
+        #   时间结构     7% — DTE甜蜜区 + theta效率 (辅助, 非核心)
+        #   流动性       3% — 保底权重, 极差已被 MAX_SPREAD_PCT 过滤
 
         # 1. 安全垫评分 (30%) — 风控基础
         t_safety_min = tier_cfg["otm_min"]
@@ -339,18 +372,19 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         else:
             ret_score = 0
 
-        # 4. 流动性评分 (10%)
-        if spread_pct <= 2:
-            liq_score = 100
-        elif spread_pct <= 5:
-            liq_score = 50 + (5 - spread_pct) / 3 * 50
-        elif spread_pct <= 10:
-            liq_score = (10 - spread_pct) / 5 * 50
+        # 4. Skew 评分 (10%) — 深度OTM Put 定价溢价
+        #    skew_ratio = deep_otm_iv / atm_iv
+        #    陡峭 = 权利金更厚 = 卖方更好的赔率
+        if skew_ratio >= 1.6:
+            skew_score = 100
+        elif skew_ratio >= 1.3:
+            skew_score = 40 + (skew_ratio - 1.3) / 0.3 * 60
+        elif skew_ratio >= 1.1:
+            skew_score = (skew_ratio - 1.1) / 0.2 * 40
         else:
-            liq_score = 0
-        liq_score = min(liq_score + min(volume / 10, 10), 100)
+            skew_score = 0
 
-        # 5. 时间结构评分 (10%) — DTE甜蜜区 + theta效率
+        # 5. 时间结构评分 (7%) — DTE甜蜜区 + theta效率
         #    14-45天: theta衰减加速但gamma风险可控
         #    theta本身不是edge, 但合理的时间窗口提升资金效率
         theta_score = min(theta_daily_pct / 5 * 100, 100) * 0.5  # theta效率 (占50%)
@@ -366,14 +400,39 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
             dte_sub = max(0, 20)  # >90天: 基础分20
         time_score = theta_score + dte_sub * 0.5  # DTE甜蜜区 (占50%)
 
+        # 6. 流动性 (3%) — 保底权重, 极差已被 MAX_SPREAD_PCT 硬过滤
+        if spread_pct <= 2:
+            liq_score = 100
+        elif spread_pct <= 5:
+            liq_score = 50 + (5 - spread_pct) / 3 * 50
+        elif spread_pct <= 10:
+            liq_score = (10 - spread_pct) / 5 * 50
+        else:
+            liq_score = 0
+        liq_score = min(liq_score + min(volume / 10, 10), 100)
+
+        # 流动性警告标签
+        liq_warning = ""
+        if spread_pct > 10:
+            liq_warning = f"流动性极差 spread {spread_pct:.1f}%"
+        elif spread_pct > 6:
+            liq_warning = f"流动性偏差 spread {spread_pct:.1f}%, 建议限价挂单"
+        elif volume == 0 and oi < 5:
+            liq_warning = "零成交+低OI, 流动性存疑"
+
         # === 综合评分 ===
         score = (
             safe_score * 0.30     # 安全垫: 活下来
             + vp_score * 0.30     # 风险溢价: Edge来源
             + ret_score * 0.20    # 年化收益: 回报合理性
-            + liq_score * 0.10    # 流动性: 能成交
-            + time_score * 0.10   # 时间结构: 资金效率
+            + skew_score * 0.10   # Skew: 深OTM定价溢价
+            + time_score * 0.07   # 时间结构: 资金效率
+            + liq_score * 0.03    # 流动性: 保底权重
         )
+
+        # 流动性惩罚: spread > 8% 额外扣分
+        if spread_pct > 8:
+            score = score * 0.92
 
         # === 账户风控评估 ===
         new_portfolio_delta = account.portfolio_delta + abs_delta
@@ -439,8 +498,15 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
 
         if spread_pct <= 2:
             pros.append(f"流动性好 spread {spread_pct:.1f}%")
-        elif spread_pct > 8:
-            cons.append(f"流动性差 spread {spread_pct:.1f}%")
+        elif liq_warning:
+            cons.append(f"⚠️ {liq_warning}")
+
+        if skew_ratio >= 1.4:
+            pros.append(f"Skew陡峭 {skew_ratio:.1f}x (OTM定价贵)")
+        elif skew_ratio >= 1.2:
+            pros.append(f"Skew正常 {skew_ratio:.1f}x")
+        elif skew_ratio < 1.0:
+            cons.append(f"Skew倒挂 {skew_ratio:.1f}x (OTM定价便宜)")
 
         if 14 <= dte <= 45:
             pros.append(f"Theta甜蜜区 {dte:.0f}天")

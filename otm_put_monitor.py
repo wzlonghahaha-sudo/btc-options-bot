@@ -216,9 +216,9 @@ def calc_odds_score(
       - 安全优先: 安全垫权重最高, 且有硬底线
       - IV必须贵: 只在期权定价偏高时卖, 否则赔率不够
       - 不追收益: 年化高不代表好, 可能是因为太接近行权价
-      - 流动性是前提: 没流动性的信号等于废纸
+      - 流动性是过滤条件: 极差直接淘汰, 偏差给警告标签, 不参与排名竞争
 
-    返回: 各维度分数 + 综合赔率评分
+    返回: 各维度分数 + 综合赔率评分 + 流动性警告
     """
     cfg = Config()
 
@@ -288,7 +288,22 @@ def calc_odds_score(
     # 4. Theta 效率评分, 提高满分标准
     theta_score = min(theta_daily_pct / 8.0 * 100, 100)
 
-    # 5. 流动性评分 (更严格)
+    # 5. Skew 评分 — 深度OTM Put 的定价溢价
+    #    skew_ratio = deep_otm_iv / atm_iv, 越高说明深度OTM定价越贵
+    #    对卖方有利: skew陡峭 = 权利金更厚
+    if skew_ratio >= 1.6:
+        skew_score = 100
+    elif skew_ratio >= 1.3:
+        skew_score = 40 + (skew_ratio - 1.3) / 0.3 * 60
+    elif skew_ratio >= 1.1:
+        skew_score = (skew_ratio - 1.1) / 0.2 * 40
+    else:
+        skew_score = 0  # 平坦或反转, OTM没有额外溢价
+
+    # 6. 流动性 — 不参与评分排名, 改为硬过滤+标签
+    #    流动性是"能不能做"的问题, 不是"好不好"的问题
+    #    极差: 已被 spread > MAX_SPREAD_PCT 硬门槛过滤
+    #    差:   保留最低权重 3%, 主要作为 liq_warning 标签
     if spread_pct <= 2:
         liq_score = 80 + (2 - spread_pct) / 2 * 20
     elif spread_pct <= 5:
@@ -302,29 +317,36 @@ def calc_odds_score(
     oi_bonus = min(oi / 20 * 10, 10)
     liq_score = min(liq_score + vol_bonus + oi_bonus, 100)
 
-    # 6. Skew 评分 — 深度OTM Put 的定价溢价
-    #    skew_ratio = deep_otm_iv / atm_iv, 越高说明深度OTM定价越贵
-    #    对卖方有利: skew陡峭 = 权利金更厚
-    if skew_ratio >= 1.6:
-        skew_score = 100
-    elif skew_ratio >= 1.3:
-        skew_score = 40 + (skew_ratio - 1.3) / 0.3 * 60
-    elif skew_ratio >= 1.1:
-        skew_score = (skew_ratio - 1.1) / 0.2 * 40
-    else:
-        skew_score = 0  # 平坦或反转, OTM没有额外溢价
+    # 流动性警告标签 (不影响评分, 在展示时提醒)
+    liq_warning = ""
+    if spread_pct > 10:
+        liq_warning = f"⚠️ 流动性极差 spread {spread_pct:.1f}%, 可能无法以合理价成交"
+    elif spread_pct > 6:
+        liq_warning = f"⚠️ 流动性偏差 spread {spread_pct:.1f}%, 建议限价挂单"
+    elif volume == 0 and oi < 5:
+        liq_warning = "⚠️ 零成交+低OI, 流动性存疑"
 
     # === 综合赔率 ===
-    # 权重: 安全 30%, IV 22%, 收益 18%, Skew 12%, 流动 10%, Theta 8%
-    # 新增 Skew 维度, 对深度OTM卖方来说 skew 陡峭 = 定价更贵 = 更好的赔率
+    # 权重重分配: 流动性从 10% 降到 3%, 释放的 7% 分给真正影响标的选择的维度
+    #   安全垫     34% — 风控永远最重要, 决定能否活下来
+    #   IV溢价     25% — 卖方 edge 的核心来源
+    #   收益       20% — 权利金厚度直接影响回报
+    #   Skew       12% — 深度OTM定价的关键驱动
+    #   Theta       6% — 辅助因子, 资金效率
+    #   流动性      3% — 保底权重, 极差的已被硬门槛过滤
+    #   合计: 0.34+0.25+0.20+0.12+0.06+0.03 = 1.00
     raw_score = (
-        safety_score * 0.30
-        + (iv_score + iv_pctl_bonus) * 0.22
-        + return_score * 0.18
+        safety_score * 0.34
+        + (iv_score + iv_pctl_bonus) * 0.25
+        + return_score * 0.20
         + skew_score * 0.12
-        + liq_score * 0.10
-        + theta_score * 0.08
+        + theta_score * 0.06
+        + liq_score * 0.03
     )
+
+    # 流动性惩罚: spread > 8% 额外扣分 (防止排到前面但实际做不了)
+    if spread_pct > 8:
+        raw_score = raw_score * 0.92  # 扣 8%
 
     # 硬门槛惩罚: 不达标直接压到 WAIT 区间
     if hard_fail:
@@ -359,6 +381,7 @@ def calc_odds_score(
         "skew_score": round(skew_score, 1),
         "liq_score": round(liq_score, 1),
         "spread_pct": round(spread_pct, 2),
+        "liq_warning": liq_warning,
         "margin_est": round(margin, 0),
         "odds_score": round(odds_score, 1),
         "signal": signal,
