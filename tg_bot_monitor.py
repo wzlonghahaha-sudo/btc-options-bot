@@ -56,6 +56,9 @@ from opportunity_scanner import (
     scan_all_opportunities, assess_account_risk,
     format_opportunities_tg, format_signal_push, ScanConfig,
 )
+from ai_analyst import SmartAnalyst
+from trade_journal import TradeJournal, SignalRecord
+from state_persistence import StatePersistence
 
 load_dotenv()
 
@@ -352,8 +355,10 @@ class MessageFormatter:
     def market_overview(spot: float, iv_surface: dict, results: list,
                         pos_alerts: list, iv_tracker: IVTracker,
                         order_alerts: list = None,
-                        risk_alerts: list = None) -> str:
-        """格式化市场概览"""
+                        risk_alerts: list = None,
+                        account_risk=None,
+                        btc_24h_change: float = None) -> str:
+        """格式化市场概览 (含 IV 警告、信号展开、持仓详情、保证金)"""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         mean_iv = iv_surface["global"]["mean"]
         iv_pctl = iv_tracker.get_iv_percentile(mean_iv)
@@ -363,16 +368,80 @@ class MessageFormatter:
         n_signal = len([r for r in results if r["signal"] == "SIGNAL"])
         n_watch = len([r for r in results if r["signal"] == "WATCH"])
 
+        # --- P2-6: BTC 24h 涨跌幅 ---
+        btc_line = f"BTC: <b>${spot:,.2f}</b>"
+        if btc_24h_change is not None:
+            arrow = "▲" if btc_24h_change >= 0 else "▼"
+            btc_line += f"  {arrow} {btc_24h_change:+.1f}% (24h)"
+
+        # --- P0-1: IV Percentile 行 + 警告 ---
+        iv_line = (
+            f"Put IV均值: <b>{mean_iv:.3f}</b>  |  "
+            f"Percentile: {iv_pctl:.0f}%  |  {iv_trend}"
+        )
+        if iv_pctl < 20:
+            iv_line += "\n❄️ IV历史低位，不建议开新仓"
+        elif iv_pctl < 40:
+            iv_line += "\n📉 IV偏低，谨慎开仓"
+        elif iv_pctl > 60:
+            iv_line += "\n🔥 IV偏高，策略有利"
+
         lines = [
             f"📊 <b>市场概览</b>  {now}",
             "",
-            f"BTC: <b>${spot:,.2f}</b>",
-            f"Put IV均值: <b>{mean_iv:.3f}</b>  |  "
-            f"Percentile: {iv_pctl:.0f}%  |  {iv_trend}",
+            btc_line,
+            iv_line,
             "",
             f"信号: 🔴 强信号 {n_strong}  |  🟡 信号 {n_signal}  |  👀 关注 {n_watch}",
-            format_risk_summary(risk_alerts or [], spot),
         ]
+
+        # --- P0-2: 信号展开显示 ---
+        strong_results = [r for r in results if r["signal"] == "STRONG"]
+        signal_results = [r for r in results if r["signal"] == "SIGNAL"]
+        watch_results = [r for r in results if r["signal"] == "WATCH"]
+
+        if strong_results:
+            lines.append(f"🔴 强信号 ({len(strong_results)}):")
+            for r in strong_results[:5]:
+                lines.append(
+                    f"  • {r['symbol']}  评分 {r['odds_score']:.0f}/100\n"
+                    f"    Bid ${r['bid']:,.0f}  年化 {r['annual_return']:.0f}%  "
+                    f"安全垫 {r['safety_pct']:.0f}%  DTE {r['dte']:.0f}天"
+                )
+        if signal_results:
+            lines.append(f"🟡 信号 ({len(signal_results)}):")
+            for r in signal_results[:5]:
+                lines.append(
+                    f"  • {r['symbol']}  评分 {r['odds_score']:.0f}/100\n"
+                    f"    Bid ${r['bid']:,.0f}  年化 {r['annual_return']:.0f}%  "
+                    f"安全垫 {r['safety_pct']:.0f}%  DTE {r['dte']:.0f}天"
+                )
+        if watch_results:
+            lines.append(f"👀 关注 ({len(watch_results)}):")
+            for r in watch_results[:3]:
+                iv_prem_str = f"IV溢价 {r['iv_premium']:+.0f}%" if 'iv_premium' in r else ""
+                lines.append(
+                    f"  • {r['symbol']}  评分 {r['odds_score']:.0f}/100\n"
+                    f"    原因: {iv_prem_str}，距行权 {r.get('safety_pct', 0):.0f}%，"
+                    f"DTE {r['dte']:.0f}天"
+                )
+
+        # --- 风控 + P1-5: 保证金使用率 ---
+        lines.append("")
+        lines.append(format_risk_summary(risk_alerts or [], spot))
+
+        if account_risk and account_risk.total_balance > 0:
+            usage_pct = account_risk.margin_usage_pct
+            if usage_pct > 50:
+                lines.append(
+                    f"⚠️ 保证金: 已用 {usage_pct:.0f}%，注意风险  "
+                    f"(${account_risk.used_margin:,.0f} / ${account_risk.total_balance:,.0f})"
+                )
+            else:
+                lines.append(
+                    f"🏦 保证金: 已用 ${account_risk.used_margin:,.0f} / "
+                    f"可用 ${account_risk.available_margin:,.0f}  ({usage_pct:.1f}%)"
+                )
 
         # IV 曲面摘要 (只显示近几个到期日)
         lines.append("")
@@ -383,17 +452,53 @@ class MessageFormatter:
             lines.append(f"  {exp}: 中位 {s['median']:.3f}  均值 {s['mean']:.3f}  "
                          f"[{s['min']:.3f} - {s['max']:.3f}]")
 
-        # 持仓摘要
-        if pos_alerts:
+        # --- P0-3: 持仓详情 (DTE + Theta + 原始权利金) ---
+        real_positions = [p for p in pos_alerts if p.get("type") != "ERROR"] if pos_alerts else []
+        if real_positions:
             lines.append("")
             lines.append("<b>持仓:</b>")
-            for p in pos_alerts:
-                if p["type"] == "ERROR":
-                    continue
-                icon = {"OK": "✅", "WARNING": "⚠️", "DANGER": "🔴"}.get(p.get("alert"), "")
+            total_pnl = 0
+            total_theta = 0
+            pos_count = 0
+
+            for p in real_positions:
+                icon = {"OK": "✅", "WARNING": "⚠️", "DANGER": "🔴", "WATCH": "👀"}.get(p.get("alert"), "")
+                direction = p.get("direction", "Short")
+                dir_tag = "📌Long" if direction == "Long" else ""
+                sym_line = f"  {icon} {p['symbol']}"
+                if dir_tag:
+                    sym_line += f"  ({dir_tag})"
+                lines.append(sym_line)
                 lines.append(
-                    f"  {icon} {p['symbol']}  ${p['pnl']:+,.0f} ({p['pnl_pct']:+.0f}%)  "
-                    f"距行权 {p['dist_to_strike']:.1f}%"
+                    f"     盈亏: ${p['pnl']:+,.0f} ({p['pnl_pct']:+.0f}%)  |  "
+                    f"距行权: {p['dist_to_strike']:.1f}%"
+                )
+                # DTE + Theta + 原始权利金
+                dte = p.get("dte", 0)
+                theta = p.get("theta", 0)
+                premium = p.get("premium_collected", 0)
+                detail_parts = []
+                if dte > 0:
+                    detail_parts.append(f"DTE: {dte}天")
+                if theta > 0:
+                    detail_parts.append(f"Theta: ${theta:.1f}/天(进账)")
+                elif theta < 0:
+                    detail_parts.append(f"Theta: ${theta:.1f}/天(损耗)")
+                if premium > 0:
+                    detail_parts.append(f"权利金: ${premium:,.0f}")
+                if detail_parts:
+                    lines.append(f"     {'  |  '.join(detail_parts)}")
+
+                total_pnl += p.get("pnl", 0)
+                total_theta += theta
+                pos_count += 1
+
+            # --- P1-4: 持仓汇总行 ---
+            if pos_count > 0:
+                lines.append("")
+                lines.append(
+                    f"持仓汇总: 总浮盈 <b>${total_pnl:+,.0f}</b>  |  "
+                    f"Theta合计 ${total_theta:+.1f}/天  |  持仓数 {pos_count}"
                 )
 
         # 挂单摘要
@@ -461,6 +566,9 @@ class MessageFormatter:
             "/top80 - 🔥 仅看80+高分机会\n"
             "/top70 - ⭐ 看70+以上机会\n"
             "/overview - 发送完整市场概览\n"
+            "/ai - 🤖 AI 策略分析 (Claude)\n"
+            "/perf - 📊 策略绩效统计\n"
+            "/journal - 📝 最近交易记录\n"
             "/strategy - 📖 策略说明 (小白版)\n"
             "/rules - 📏 具体入场/风控规则\n"
             "/help - 显示此帮助\n\n"
@@ -468,7 +576,7 @@ class MessageFormatter:
             "• 80+高分机会: 即时详情推送 (1h去重)\n"
             "• 55-79普通机会: 轻量提示 (4h去重)\n"
             "• 持仓预警: 即时推送\n"
-            "• 市场概览: 每4小时\n"
+            "• 市场概览 + AI分析: 每4小时\n"
             "• 扫描间隔: 常规3分钟, 波动时1分钟"
         )
 
@@ -673,6 +781,9 @@ class MonitorService:
         self.risk_engine = RiskEngine()
         self.vol_analyzer = VolatilityAnalyzer()
         self.fmt = MessageFormatter()
+        self.ai_analyst = SmartAnalyst()
+        self.journal = TradeJournal()
+        self.state = StatePersistence()
 
         self.scan_count = 0
         self.start_time = time.time()
@@ -685,11 +796,80 @@ class MonitorService:
         self.running = True
         self.update_offset = 0
 
+        # P1-4: 恢复持久化状态
+        self._restore_state()
+
+    def _restore_state(self):
+        """从持久化文件恢复运行时状态"""
+        try:
+            # 恢复冷却状态
+            cooldowns = self.state.load_cooldowns()
+            if cooldowns:
+                self.cooldown.signal_sent = cooldowns
+                log.info(f"恢复冷却状态: {len(cooldowns)} 条")
+
+            # 恢复价格追踪
+            pt = self.state.load_price_tracker()
+            if pt.get("prices"):
+                self.risk_engine.price_tracker.prices = pt["prices"]
+                log.info(f"恢复价格数据: {len(pt['prices'])} 个点")
+            if pt.get("daily_open") is not None:
+                self.risk_engine.price_tracker.daily_open = pt["daily_open"]
+                self.risk_engine.price_tracker.daily_open_date = pt.get("daily_open_date")
+                log.info(f"恢复日开盘价: ${pt['daily_open']:,.0f}")
+
+            # 恢复风控冷却
+            risk_cd = self.state.load_risk_cooldowns()
+            if risk_cd:
+                self.risk_engine.last_alerts = risk_cd
+                log.info(f"恢复风控冷却: {len(risk_cd)} 条")
+
+            # 恢复 TG update offset
+            offset = self.state.load_update_offset()
+            if offset > 0:
+                self.update_offset = offset
+                log.info(f"恢复 TG offset: {offset}")
+
+        except Exception as e:
+            log.warning(f"状态恢复失败: {e}")
+
+    def _save_state(self):
+        """保存运行时状态到文件"""
+        try:
+            self.state.save_cooldowns(self.cooldown.signal_sent)
+            pt = self.risk_engine.price_tracker
+            self.state.save_price_tracker(pt.prices, pt.daily_open, pt.daily_open_date)
+            self.state.save_risk_cooldowns(self.risk_engine.last_alerts)
+            self.state.save_update_offset(self.update_offset)
+            self.state.save()
+        except Exception as e:
+            log.error(f"状态保存失败: {e}")
+
     def uptime_str(self) -> str:
         elapsed = time.time() - self.start_time
         hours = int(elapsed // 3600)
         minutes = int((elapsed % 3600) // 60)
         return f"{hours}h {minutes}m"
+
+    def _generate_iv_chart(self, result: dict, btc_24h_change: float = None) -> str:
+        """生成 IV 报告图表, 返回图片路径 (失败返回空字符串)"""
+        try:
+            from iv_chart import generate_report_chart
+            positions = result.get("pos_alerts", [])
+            account_risk = result.get("account_risk")
+            chart_path = generate_report_chart(
+                data=result["data"],
+                iv_surface=result["iv_surface"],
+                spot=result["data"]["spot"],
+                iv_tracker=self.iv_tracker,
+                positions=positions,
+                account_risk=account_risk,
+                btc_24h_change=btc_24h_change,
+            )
+            return chart_path
+        except Exception as e:
+            log.error(f"IV 报告图表生成失败: {e}", exc_info=True)
+            return ""
 
     # --- 扫描 ---
     def do_scan(self) -> dict:
@@ -707,7 +887,12 @@ class MonitorService:
         })
         self.iv_tracker.save()
 
-        results = scan_opportunities(data, iv_surface, self.iv_tracker)
+        # P1-5: V1 扫描降频 (每5次才跑一次, V2 已覆盖)
+        if self.scan_count % 5 == 0 or self.scan_count <= 1:
+            results = scan_opportunities(data, iv_surface, self.iv_tracker)
+        else:
+            results = self.last_result.get("results", []) if self.last_result else []
+
         pos_alerts = monitor_positions(self.api, data)
         order_alerts = monitor_open_orders(self.api, data)
 
@@ -724,9 +909,11 @@ class MonitorService:
             log.error(f"风控检查失败: {e}")
             risk_alerts = []
 
-        # 收益优化分析 (每10次扫描做一次, 避免频繁API调用)
+        # P1-6: 止盈分析频率自适应
+        # 波动市场(1分钟间隔)每3次, 常规市场每10次
+        profit_interval = 3 if self.current_interval <= SCAN_INTERVAL_VOLATILE else 10
         profit_analysis = None
-        if self.scan_count % 10 == 0 or self.scan_count <= 1:
+        if self.scan_count % profit_interval == 0 or self.scan_count <= 1:
             try:
                 iv_trend = self.iv_tracker.get_iv_trend()
                 profit_analysis = analyze_position_optimization(
@@ -775,6 +962,57 @@ class MonitorService:
             "scan_time": scan_time,
         }
         self.last_result = result
+
+        # P2-11: 保存 IV 曲面快照
+        try:
+            self.state.save_iv_surface_snapshot(iv_surface, data["timestamp"])
+        except Exception:
+            pass
+
+        # P0-1: 交易日志 — 检测持仓变化
+        try:
+            positions_raw = self.api.get_position()
+            events = self.journal.check_position_changes(positions_raw, data["spot"])
+            for ev in events:
+                if ev["type"] == "NEW":
+                    direction = "卖出" if ev["qty"] < 0 else "买入"
+                    short_sym = ev["symbol"].split("BTC-")[-1]
+                    self.tg.broadcast(
+                        f"📝 <b>新开仓记录</b>\n\n"
+                        f"{short_sym} {direction} {abs(ev['qty'])}张\n"
+                        f"入场价 ${ev['entry']:,.0f}  |  BTC ${ev['spot']:,.0f}",
+                        silent=True,
+                    )
+                elif ev["type"] == "CLOSED":
+                    short_sym = ev["symbol"].split("BTC-")[-1]
+                    self.tg.broadcast(
+                        f"📝 <b>平仓记录</b>\n\n"
+                        f"{short_sym} 已平仓\n"
+                        f"BTC ${ev['spot']:,.0f}",
+                        silent=True,
+                    )
+        except Exception as e:
+            log.error(f"交易日志更新失败: {e}")
+
+        # P2-10: 挂单成交检测
+        try:
+            current_orders = self.api.get_open_orders()
+            order_events = self.journal.check_order_fills(current_orders)
+            for ev in order_events:
+                if ev["type"] == "FILLED":
+                    side_cn = "卖出" if ev["side"] == "SELL" else "买入"
+                    short_sym = ev["symbol"].split("BTC-")[-1]
+                    self.tg.broadcast(
+                        f"🔔 <b>挂单成交!</b>\n\n"
+                        f"{short_sym} {side_cn} {ev['qty']}张\n"
+                        f"成交价 ${ev['price']:,.0f}",
+                    )
+        except Exception as e:
+            log.error(f"挂单检测失败: {e}")
+
+        # P1-4: 定期保存状态
+        self._save_state()
+
         return result
 
     # --- 推送决策 ---
@@ -857,6 +1095,25 @@ class MonitorService:
         if not new_top:
             return
 
+        # P0-1: 记录推送的信号到交易日志
+        for o in new_top:
+            try:
+                sig = SignalRecord(
+                    symbol=o.symbol,
+                    signal_level="STRONG" if o.score >= 90 else "SIGNAL",
+                    score=o.score,
+                    bid=o.bid,
+                    annual_return=o.annual_return,
+                    safety_pct=o.safety_pct,
+                    iv_premium=o.iv_premium,
+                    spot=self.last_spot,
+                    timestamp=time.time(),
+                    source="v2",
+                )
+                self.journal.record_signal(sig)
+            except Exception:
+                pass
+
         msg = format_signal_push(opps, account)
         if msg:
             self.tg.broadcast(msg)
@@ -906,7 +1163,25 @@ class MonitorService:
             log.info(f"推送止盈建议: {p['symbol']} → {tp.action} ({tp.urgency})")
 
     def send_overview(self, result: dict):
-        """发送市场概览"""
+        """发送市场概览 (文字 + IV图表 + AI分析)"""
+        # P2-6: 获取 BTC 24h 涨跌幅
+        btc_24h_change = None
+        try:
+            # 优先从 price_tracker 获取 (需运行超过一段时间)
+            change = self.risk_engine.price_tracker.get_change_pct(86400)
+            if change != 0:
+                btc_24h_change = change
+            else:
+                # 备选: 从 Binance 合约 API 获取 24h ticker
+                resp = requests.get(
+                    "https://fapi.binance.com/fapi/v1/ticker/24hr",
+                    params={"symbol": "BTCUSDT"}, timeout=5
+                )
+                if resp.ok:
+                    btc_24h_change = float(resp.json().get("priceChangePercent", 0))
+        except Exception:
+            pass
+
         msg = self.fmt.market_overview(
             result["data"]["spot"],
             result["iv_surface"],
@@ -915,10 +1190,47 @@ class MonitorService:
             self.iv_tracker,
             order_alerts=result.get("order_alerts", []),
             risk_alerts=result.get("risk_alerts", []),
+            account_risk=result.get("account_risk"),
+            btc_24h_change=btc_24h_change,
         )
         self.tg.broadcast(msg, silent=True)
         self.last_overview_time = time.time()
         log.info("推送市场概览")
+
+        # IV 图表 + AI 策略分析 (图文合一推送)
+        chart_path = self._generate_iv_chart(result, btc_24h_change)
+
+        ai_report = ""
+        if self.ai_analyst.is_available:
+            try:
+                ai_report = self.ai_analyst.analyze(result, self.iv_tracker)
+            except Exception as e:
+                log.error(f"AI 分析失败: {e}")
+
+        if chart_path:
+            # 图文合一: 图表作为 Photo, AI 报告作为 caption (TG caption 限1024字符)
+            caption = ""
+            if ai_report:
+                # caption 限制 1024 字符, 超出则截断
+                if len(ai_report) <= 1024:
+                    caption = ai_report
+                else:
+                    # 图表带简短 caption, AI 报告单独发
+                    caption = "📊 <b>IV Dashboard</b> — 详细分析见下方"
+            else:
+                caption = "📊 <b>IV Dashboard</b>"
+
+            self.tg.broadcast_photo(chart_path, caption=caption, silent=True)
+            log.info("推送 IV 图表")
+
+            # 如果 AI 报告太长没放进 caption, 单独发
+            if ai_report and len(ai_report) > 1024:
+                self.tg.broadcast(ai_report, silent=True)
+                log.info("推送 AI 策略分析 (单独)")
+        elif ai_report:
+            # 图表生成失败, 纯文字发 AI 报告
+            self.tg.broadcast(ai_report, silent=True)
+            log.info("推送 AI 策略分析 (无图表)")
 
     # --- TG 命令处理 ---
     def handle_commands(self):
@@ -934,6 +1246,10 @@ class MonitorService:
             # 只响应授权用户
             if chat_id != TG_CHAT_ID:
                 continue
+
+            # P1-7: 支持群组命令 @botname 后缀 (如 /scan@BN_options_bot)
+            if "@" in text:
+                text = text.split("@")[0]
 
             if text == "/help" or text == "/start":
                 self.tg.send(self.fmt.help_msg())
@@ -961,19 +1277,39 @@ class MonitorService:
                     lines = []
                     # 持仓
                     pos = self.last_result["pos_alerts"]
+                    total_pnl = 0
+                    total_theta = 0
+                    pos_count = 0
                     if pos:
                         lines.append("📋 <b>当前持仓</b>\n")
                         for p in pos:
                             if p["type"] == "ERROR":
                                 lines.append(f"  ❌ {p['msg']}")
                                 continue
-                            icon = {"OK": "✅", "WARNING": "⚠️", "DANGER": "🔴"}.get(p.get("alert"), "")
+                            icon = {"OK": "✅", "WARNING": "⚠️", "DANGER": "🔴", "WATCH": "👀"}.get(p.get("alert"), "")
+                            dte = p.get("dte", 0)
+                            theta = p.get("theta", 0)
+                            premium = p.get("premium_collected", 0)
+                            direction = p.get("direction", "Short")
+                            dir_tag = " (Long)" if direction == "Long" else ""
+                            theta_label = "进账" if theta >= 0 else "损耗"
                             lines.append(
-                                f"{icon} <b>{p['symbol']}</b>\n"
+                                f"{icon} <b>{p['symbol']}{dir_tag}</b>\n"
                                 f"  数量: {p['qty']}  入场: ${p['entry']:,.0f}  "
                                 f"当前: ${p['mark']:,.0f}\n"
                                 f"  盈亏: <b>${p['pnl']:+,.0f}</b> ({p['pnl_pct']:+.0f}%)  "
                                 f"距行权: {p['dist_to_strike']:.1f}%\n"
+                                f"  DTE: {dte}天  |  Theta: ${theta:.1f}/天({theta_label})"
+                                + (f"  |  权利金: ${premium:,.0f}" if premium > 0 else "")
+                                + "\n"
+                            )
+                            total_pnl += p.get("pnl", 0)
+                            total_theta += theta
+                            pos_count += 1
+                        if pos_count > 0:
+                            lines.append(
+                                f"<b>汇总:</b> 总浮盈 ${total_pnl:+,.0f}  |  "
+                                f"Theta合计 ${total_theta:+.1f}/天  |  持仓数 {pos_count}\n"
                             )
                     else:
                         lines.append("📋 暂无持仓\n")
@@ -1098,11 +1434,115 @@ class MonitorService:
                 else:
                     self.tg.send("⏳ 尚未完成首次扫描")
 
+            elif text == "/ai":
+                if not self.ai_analyst.is_available:
+                    self.tg.send("❌ AI 分析未启用 (ANTHROPIC_API_KEY 未配置)")
+                elif self.last_result:
+                    # 优先返回缓存 (如果不到30分钟)
+                    cached = self.ai_analyst.get_cached_report()
+                    age = time.time() - self.ai_analyst.last_analysis_time
+                    if cached and age < 1800:
+                        # 缓存报告也带图表
+                        chart_path = self._generate_iv_chart(self.last_result)
+                        if chart_path:
+                            if len(cached) <= 1024:
+                                self.tg.send_photo(chart_path, caption=cached)
+                            else:
+                                self.tg.send_photo(chart_path, caption="📊 <b>IV Dashboard</b> — 详细分析见下方")
+                                self.tg.send(cached)
+                        else:
+                            self.tg.send(cached)
+                    else:
+                        self.tg.send("🤖 正在分析...")
+                        report = self.ai_analyst.analyze(self.last_result, self.iv_tracker)
+                        if report:
+                            chart_path = self._generate_iv_chart(self.last_result)
+                            if chart_path:
+                                if len(report) <= 1024:
+                                    self.tg.send_photo(chart_path, caption=report)
+                                else:
+                                    self.tg.send_photo(chart_path, caption="📊 <b>IV Dashboard</b> — 详细分析见下方")
+                                    self.tg.send(report)
+                            else:
+                                self.tg.send(report)
+                        else:
+                            self.tg.send("❌ AI 分析失败，请查看日志")
+                else:
+                    self.tg.send("⏳ 尚未完成首次扫描")
+
             elif text == "/overview":
                 if self.last_result:
                     self.send_overview(self.last_result)
                 else:
                     self.tg.send("⏳ 尚未完成首次扫描")
+
+            elif text == "/perf":
+                msg = self.journal.format_performance_tg()
+                self.tg.send(msg)
+
+            elif text == "/journal":
+                # 显示最近 5 笔交易记录
+                trades = self.journal.data.get("trades", [])
+                if not trades:
+                    self.tg.send("📊 暂无交易记录")
+                else:
+                    lines = ["📊 <b>最近交易记录</b>\n"]
+                    for t in reversed(trades[-5:]):
+                        status_icon = "🟢" if t.get("status") == "OPEN" else "⚪"
+                        short_sym = t["symbol"].split("BTC-")[-1]
+                        direction = "Short" if t.get("direction") == "SHORT" else "Long"
+                        lines.append(f"{status_icon} <b>{short_sym}</b> ({direction})")
+                        lines.append(f"  入场: ${t['entry_price']:,.0f}  数量: {abs(t['qty'])}")
+                        if t.get("status") == "CLOSED":
+                            lines.append(
+                                f"  PnL: ${t.get('realized_pnl', 0):+,.0f} "
+                                f"({t.get('realized_pnl_pct', 0):+.1f}%)"
+                            )
+                            lines.append(f"  持有: {t.get('holding_days', 0):.0f}天  原因: {t.get('exit_reason', '?')}")
+                        else:
+                            lines.append(f"  当前: ${t.get('last_mark', 0):,.0f}")
+                            peak = t.get("peak_profit_pct", 0)
+                            lines.append(f"  峰值盈利: {peak:+.0f}%")
+                        lines.append("")
+                    # 信号质量
+                    hit = self.journal.signal_hit_rate()
+                    if hit["total_signals"] > 0:
+                        lines.append(
+                            f"信号质量: {hit['total_signals']}条推送, "
+                            f"{hit['acted_on']}条入场 ({hit['hit_rate']:.0f}%)"
+                        )
+                    self.tg.send("\n".join(lines))
+
+    def _check_proactive_roll(self, result: dict):
+        """P2-8: 到期前主动 Roll 提醒"""
+        pos_alerts = result.get("pos_alerts", [])
+        for p in pos_alerts:
+            if p.get("type") != "POSITION":
+                continue
+            if p.get("direction") != "Short":
+                continue
+            dte = p.get("dte", 999)
+            pnl_pct = p.get("pnl_pct", 0)
+            sym = p.get("symbol", "")
+
+            # DTE < 21 + 盈利 > 30% → 主动提醒 Roll
+            if dte < 21 and pnl_pct > 30:
+                key = f"roll_remind:{sym}"
+                now = time.time()
+                last = self.cooldown.signal_sent.get(key, {}).get("time", 0)
+                if now - last < 43200:  # 12小时冷却
+                    continue
+                self.cooldown.signal_sent[key] = {"signal": "ROLL_REMIND", "time": now}
+
+                short_sym = sym.split("BTC-")[-1]
+                self.tg.broadcast(
+                    f"🔄 <b>Roll 提醒</b>\n\n"
+                    f"<b>{short_sym}</b> DTE {dte}天 + 盈利 {pnl_pct:.0f}%\n"
+                    f"临近到期且已有不错盈利, 建议考虑 Roll 到远期合约\n\n"
+                    f"👉 /profit 查看详细 Roll 建议",
+                    silent=True,
+                )
+                log.info(f"推送 Roll 提醒: {sym} DTE={dte} PnL={pnl_pct:.0f}%")
 
     # --- 命令监听线程 ---
     def _command_loop(self):
@@ -1168,6 +1608,9 @@ class MonitorService:
                 # v2 机会信号
                 self.process_v2_signals(result)
 
+                # P2-8: 到期前主动 Roll 提醒 (DTE < 21 + 盈利 > 30%)
+                self._check_proactive_roll(result)
+
                 # 定期概览
                 if time.time() - self.last_overview_time > OVERVIEW_INTERVAL:
                     self.send_overview(result)
@@ -1220,6 +1663,8 @@ class MonitorService:
         self.running = False
         self.tg.broadcast("🔴 <b>监控 Bot 已停止</b>")
         self.iv_tracker.save()
+        self._save_state()
+        self.journal.save()
         log.info("Bot 已停止")
 
 

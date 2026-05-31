@@ -20,6 +20,7 @@ import time
 import math
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from margin_calc import calc_put_margin
 
 
 # ============================================================
@@ -40,9 +41,9 @@ class RiskConfig:
     MARGIN_USAGE_CRITICAL = 0.95    # 95% → CRITICAL, 接近爆仓
 
     # --- BTC 市场波动 ---
-    # 短期 (本次扫描 vs 上次)
-    BTC_DROP_WATCH = 1.0       # 单次扫描间跌1% → WATCH
-    BTC_DROP_WARN = 2.0        # 跌2% → WARNING
+    # 短期 (本次扫描 vs 上次, 5分钟窗口)
+    BTC_DROP_WATCH = 1.5       # 单次扫描间跌1.5% → WATCH (1%太容易触发)
+    BTC_DROP_WARN = 2.5        # 跌2.5% → WARNING
     BTC_DROP_DANGER = 4.0      # 跌4% → DANGER
     BTC_DROP_CRITICAL = 7.0    # 跌7% → CRITICAL, 可能闪崩
 
@@ -58,10 +59,11 @@ class RiskConfig:
     DIST_STRIKE_CRITICAL = 5.0     # 5% → CRITICAL, 即将 ITM
 
     # --- 希腊值 ---
-    DELTA_WARN = 0.15          # |delta| 超过 0.15 → WARNING (不再是深度OTM)
+    DELTA_WARN = 0.15          # 单合约 |delta*qty| 超过 0.15 → WARNING
     DELTA_DANGER = 0.25        # 0.25 → DANGER
-    GAMMA_WARN = 0.0001        # gamma 过大 → WARNING (gamma * qty * spot)
-    VEGA_EXPOSURE_WARN = 50.0  # vega * 持仓量 > 50 → WARNING (IV涨1%亏$50)
+    GAMMA_WARN = 0.0003        # gamma 暴露阈值 (仅临近到期+接近行权才真正危险)
+    GAMMA_DANGER = 0.001       # gamma 极端暴露 → DANGER
+    VEGA_EXPOSURE_WARN = 100.0 # vega * 持仓量 > 100 → WATCH (IV涨1%亏$100)
 
     # --- 到期风险 ---
     DTE_WATCH = 7              # 7天内到期 → WATCH
@@ -195,8 +197,68 @@ class RiskEngine:
             mark = marks.get(sym, {})
             alerts.extend(self._check_position(pos, mark, spot))
 
+        # 3. 仓位集中度检查 (跨持仓)
+        alerts.extend(self._check_concentration(positions, spot))
+
         # 按严重程度排序
         alerts.sort(key=lambda a: a.level_rank, reverse=True)
+
+        return alerts
+
+    def _check_concentration(self, positions: list, spot: float) -> list[RiskAlert]:
+        """检查持仓集中度风险"""
+        alerts = []
+        from collections import defaultdict
+
+        # 按到期周分组
+        exp_groups = defaultdict(list)
+        for pos in positions:
+            qty = float(pos.get("quantity", 0))
+            if qty >= 0 or "-P" not in pos.get("symbol", ""):
+                continue
+            sym = pos["symbol"]
+            parts = sym.split("-")
+            if len(parts) >= 2:
+                exp_groups[parts[1]].append(sym)
+
+        # 检查同到期日集中
+        for exp, syms in exp_groups.items():
+            if len(syms) >= 3:
+                alerts.append(RiskAlert(
+                    level="WARNING", category="MARGIN", symbol=f"BTC-{exp}",
+                    title=f"{len(syms)} 个持仓同到期日 {exp}",
+                    detail=f"合约: {', '.join(s.split('BTC-')[-1] for s in syms)}\n"
+                           f"BTC 大跌时所有仓位同时受损",
+                    action="考虑分散到期日, 降低尾部风险集中度",
+                ))
+            elif len(syms) >= 2:
+                alerts.append(RiskAlert(
+                    level="WATCH", category="MARGIN", symbol=f"BTC-{exp}",
+                    title=f"{len(syms)} 个持仓同到期日 {exp}",
+                    detail=f"合约: {', '.join(s.split('BTC-')[-1] for s in syms)}",
+                ))
+
+        # 检查行权价集中
+        strike_groups = defaultdict(list)
+        for pos in positions:
+            qty = float(pos.get("quantity", 0))
+            if qty >= 0 or "-P" not in pos.get("symbol", ""):
+                continue
+            parts = pos["symbol"].split("-")
+            if len(parts) >= 3:
+                strike = float(parts[2])
+                # 按 $5000 范围分组
+                bucket = int(strike / 5000) * 5000
+                strike_groups[bucket].append(pos["symbol"])
+
+        for bucket, syms in strike_groups.items():
+            if len(syms) >= 3:
+                alerts.append(RiskAlert(
+                    level="WARNING", category="MARGIN", symbol="PORTFOLIO",
+                    title=f"{len(syms)} 个持仓行权价集中在 ${bucket:,}-${bucket+5000:,}",
+                    detail=f"合约: {', '.join(s.split('BTC-')[-1] for s in syms)}",
+                    action="行权价过于集中, BTC 跌到该区域时风险叠加",
+                ))
 
         return alerts
 
@@ -349,15 +411,8 @@ class RiskEngine:
                 detail=f"行权价 ${strike:,.0f}",
             ))
 
-        # === 3. 保证金 / 爆仓估算 ===
-        # 简化估算: 卖 Put 保证金 ≈ max(spot * margin_rate - OTM_amount, spot * min_margin_rate)
-        otm_amount = max(spot - strike, 0)  # 如果 ITM 则为0
-        margin_est = max(
-            spot * cfg.MARGIN_RATE - otm_amount,
-            spot * cfg.MAINT_MARGIN_RATE
-        ) * abs_qty
-
-        maint_margin = spot * cfg.MAINT_MARGIN_RATE * abs_qty
+        # === 3. 保证金 / 爆仓估算 (统一公式) ===
+        margin_est = calc_put_margin(spot, strike, abs_qty)
 
         # 保证金使用率 ≈ 当前持仓市值 / 保证金
         margin_usage = mark_price * abs_qty / margin_est if margin_est > 0 else 0
@@ -403,16 +458,48 @@ class RiskEngine:
                 action="注意: BTC 继续下跌会导致 delta 加速增大",
             ))
 
-        # Gamma 风险 (gamma * spot^2 * qty / 100 = BTC涨跌1%时delta变化量)
+        # 提前计算 DTE (Gamma 和到期风险都要用)
+        dte = 999
+        if expiry_ts > 0:
+            _now = datetime.now(timezone.utc)
+            _expiry = datetime.fromtimestamp(expiry_ts / 1000, tz=timezone.utc)
+            dte = max((_expiry - _now).total_seconds() / 86400, 0)
+
+        # Gamma 风险 — 只在距行权近 或 临近到期时才有实际意义
+        # gamma_exposure = gamma * qty * spot^2 / 10000 (BTC跌1%时delta变化量的放大值)
         gamma_exposure = abs(gamma) * abs_qty * spot * spot / 10000
-        if gamma_exposure > cfg.GAMMA_WARN * spot:
+        gamma_threshold = cfg.GAMMA_WARN * spot
+        gamma_danger_threshold = cfg.GAMMA_DANGER * spot
+
+        # Gamma 告警需要结合距行权和DTE综合判断:
+        # - 远期 + 深度OTM → gamma 天然大但无实际风险, 降级或忽略
+        # - 临近到期 + 接近行权 → gamma 暴增才是真风险
+        gamma_is_real_risk = dist < 20 or dte <= 14
+
+        if gamma_exposure > gamma_danger_threshold and gamma_is_real_risk:
             alerts.append(RiskAlert(
-                level="WARNING", category="GREEKS", symbol=sym,
-                title=f"Gamma 风险偏高",
-                detail=f"Gamma={gamma:.8f}, 价格加速敏感度 {gamma_exposure:.4f}\n"
-                       f"BTC 波动会导致 Delta 快速变化",
-                action="临近到期或接近行权价时 gamma 会暴增",
+                level="DANGER", category="GREEKS", symbol=sym,
+                title=f"Gamma 风险高!",
+                detail=f"Gamma={gamma:.8f}, 暴露度 {gamma_exposure:.2f}\n"
+                       f"距行权 {dist:.0f}%, BTC 波动将导致 Delta 剧烈变化",
+                action="Gamma 暴增区, 建议平仓或对冲",
             ))
+        elif gamma_exposure > gamma_threshold:
+            if gamma_is_real_risk:
+                alerts.append(RiskAlert(
+                    level="WARNING", category="GREEKS", symbol=sym,
+                    title=f"Gamma 偏高 (距行权近)",
+                    detail=f"Gamma={gamma:.8f}, 暴露度 {gamma_exposure:.2f}\n"
+                           f"距行权 {dist:.0f}%, 注意 Delta 加速",
+                    action="持续关注, BTC 继续下跌会使 gamma 进一步放大",
+                ))
+            # 远期+深度OTM → 降为 WATCH, 不推送
+            else:
+                alerts.append(RiskAlert(
+                    level="WATCH", category="GREEKS", symbol=sym,
+                    title=f"Gamma 偏高 (远期, 风险低)",
+                    detail=f"Gamma={gamma:.8f}, 距行权 {dist:.0f}% + DTE远, 实际影响小",
+                ))
 
         # Vega 暴露
         vega_exposure = abs(vega) * abs_qty
@@ -423,11 +510,9 @@ class RiskEngine:
                 detail=f"IV 每上升 1%, 浮亏增加约 ${vega_exposure:,.0f}",
             ))
 
-        # === 5. 到期风险 ===
+        # === 5. 到期风险 === (dte 已在上方预计算)
         if expiry_ts > 0:
-            now = datetime.now(timezone.utc)
             expiry = datetime.fromtimestamp(expiry_ts / 1000, tz=timezone.utc)
-            dte = max((expiry - now).total_seconds() / 86400, 0)
 
             if dte <= cfg.DTE_DANGER:
                 alerts.append(RiskAlert(
@@ -467,6 +552,10 @@ class RiskEngine:
             "CRITICAL": self.cfg.COOLDOWN_CRITICAL,
         }
         cooldown = cooldowns.get(alert.level, 3600)
+
+        # Greeks 类告警是慢变量, 用更长的冷却周期减少噪音
+        if alert.category == "GREEKS" and alert.level in ("WATCH", "WARNING"):
+            cooldown = max(cooldown, 7200)  # 至少 2 小时
 
         if now - last > cooldown:
             self.last_alerts[key] = now

@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PID_FILE="$SCRIPT_DIR/bot.pid"
 LOG_FILE="$SCRIPT_DIR/bot.log"
 WATCHDOG_PID_FILE="$SCRIPT_DIR/watchdog.pid"
-DEPS="requests python-dotenv matplotlib numpy"
+DEPS="requests python-dotenv matplotlib numpy anthropic"
 
 echo "============================================================"
 echo "  BTC Put Monitor Bot — 自愈启动"

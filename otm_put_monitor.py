@@ -39,6 +39,7 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 from binance_options import BinanceOptionsAPI, ts_to_str
+from margin_calc import calc_put_margin_per_contract
 
 
 # ============================================================
@@ -206,6 +207,7 @@ def calc_odds_score(
     volume: float,
     oi: float,
     iv_percentile: float,
+    skew_ratio: float = 1.0,
 ) -> dict:
     """
     计算深度 OTM Put 的卖出赔率 (严格版)
@@ -221,7 +223,7 @@ def calc_odds_score(
     cfg = Config()
 
     # === 基础计算 ===
-    margin = max(spot, strike) * cfg.MARGIN_RATE
+    margin = calc_put_margin_per_contract(spot, strike)
     annual_return = (bid / margin) * (365 / dte) * 100 if margin > 0 and dte > 0 else 0
 
     iv_premium = (mark_iv - median_iv) / median_iv * 100 if median_iv > 0 else 0
@@ -300,14 +302,27 @@ def calc_odds_score(
     oi_bonus = min(oi / 20 * 10, 10)
     liq_score = min(liq_score + vol_bonus + oi_bonus, 100)
 
+    # 6. Skew 评分 — 深度OTM Put 的定价溢价
+    #    skew_ratio = deep_otm_iv / atm_iv, 越高说明深度OTM定价越贵
+    #    对卖方有利: skew陡峭 = 权利金更厚
+    if skew_ratio >= 1.6:
+        skew_score = 100
+    elif skew_ratio >= 1.3:
+        skew_score = 40 + (skew_ratio - 1.3) / 0.3 * 60
+    elif skew_ratio >= 1.1:
+        skew_score = (skew_ratio - 1.1) / 0.2 * 40
+    else:
+        skew_score = 0  # 平坦或反转, OTM没有额外溢价
+
     # === 综合赔率 ===
-    # 权重: 安全 35%, IV 25%, 收益 20%, 流动 12%, Theta 8%
-    # 安全和IV权重提到60%, 这才是深度OTM卖方的核心
+    # 权重: 安全 30%, IV 22%, 收益 18%, Skew 12%, 流动 10%, Theta 8%
+    # 新增 Skew 维度, 对深度OTM卖方来说 skew 陡峭 = 定价更贵 = 更好的赔率
     raw_score = (
-        safety_score * 0.35
-        + (iv_score + iv_pctl_bonus) * 0.25
-        + return_score * 0.20
-        + liq_score * 0.12
+        safety_score * 0.30
+        + (iv_score + iv_pctl_bonus) * 0.22
+        + return_score * 0.18
+        + skew_score * 0.12
+        + liq_score * 0.10
         + theta_score * 0.08
     )
 
@@ -340,6 +355,8 @@ def calc_odds_score(
         "breakeven": round(breakeven, 2),
         "theta_daily_pct": round(theta_daily_pct, 2),
         "theta_score": round(theta_score, 1),
+        "skew_ratio": round(skew_ratio, 2),
+        "skew_score": round(skew_score, 1),
         "liq_score": round(liq_score, 1),
         "spread_pct": round(spread_pct, 2),
         "margin_est": round(margin, 0),
@@ -442,6 +459,36 @@ def scan_opportunities(data: dict, iv_surface: dict, iv_tracker: IVTracker) -> l
     # 全局 IV percentile
     iv_pctl = iv_tracker.get_iv_percentile(iv_surface["global"]["mean"])
 
+    # 计算每个到期日的 skew ratio (deep_otm_iv / atm_iv)
+    skew_by_exp = {}
+    for sym_s, m_s in data["marks"].items():
+        if "-P" not in sym_s:
+            continue
+        parts_s = sym_s.split("-")
+        if len(parts_s) < 4:
+            continue
+        exp_s = parts_s[1]
+        strike_s = float(parts_s[2])
+        iv_s = float(m_s.get("markIV", 0))
+        if iv_s <= 0:
+            continue
+        moneyness_s = (strike_s / spot - 1) * 100
+        if exp_s not in skew_by_exp:
+            skew_by_exp[exp_s] = {"atm_ivs": [], "deep_otm_ivs": []}
+        if abs(moneyness_s) < 5:
+            skew_by_exp[exp_s]["atm_ivs"].append(iv_s)
+        elif -40 < moneyness_s < -20:
+            skew_by_exp[exp_s]["deep_otm_ivs"].append(iv_s)
+
+    exp_skew_ratios = {}
+    for exp_s, ivs in skew_by_exp.items():
+        if ivs["atm_ivs"] and ivs["deep_otm_ivs"]:
+            atm_avg = sum(ivs["atm_ivs"]) / len(ivs["atm_ivs"])
+            otm_avg = sum(ivs["deep_otm_ivs"]) / len(ivs["deep_otm_ivs"])
+            exp_skew_ratios[exp_s] = otm_avg / atm_avg if atm_avg > 0 else 1.0
+        else:
+            exp_skew_ratios[exp_s] = 1.0  # 数据不足, 假设中性
+
     results = []
 
     for sym, contract in data["contracts"].items():
@@ -496,13 +543,16 @@ def scan_opportunities(data: dict, iv_surface: dict, iv_tracker: IVTracker) -> l
         exp_key = sym.split("-")[1]
         median_iv = iv_surface["by_exp"].get(exp_key, {}).get("median", mark_iv)
 
+        # 获取该到期日的 skew ratio
+        skew_r = exp_skew_ratios.get(exp_key, 1.0)
+
         # 计算赔率
         odds = calc_odds_score(
             bid=bid, strike=strike, spot=spot, dte=dte,
             delta=delta, mark_iv=mark_iv, median_iv=median_iv,
             theta=theta, mark_price=mark_price,
             spread_pct=spread_pct, volume=volume, oi=oi,
-            iv_percentile=iv_pctl,
+            iv_percentile=iv_pctl, skew_ratio=skew_r,
         )
 
         results.append({
@@ -590,6 +640,7 @@ def monitor_positions(api: BinanceOptionsAPI, data: dict) -> list[dict]:
     """监控当前持仓"""
     cfg = Config()
     spot = data["spot"]
+    marks = data.get("marks", {})
     alerts = []
 
     try:
@@ -607,22 +658,48 @@ def monitor_positions(api: BinanceOptionsAPI, data: dict) -> list[dict]:
         mark = float(p.get("markPrice", 0))
         parts = sym.split("-")
 
-        # 只关注卖出的 Put
-        if qty > 0 or "-P" not in sym:
+        # 只关注 Put (包括买入和卖出)
+        if "-P" not in sym:
             continue
 
         strike = float(parts[2]) if len(parts) >= 4 else 0
         abs_qty = abs(qty)
+        is_short = qty < 0  # 卖出 = Short, 买入 = Long
 
-        # 浮盈亏
-        pnl = (entry - mark) * abs_qty  # 卖出: entry > mark 则盈利
+        # DTE 计算: 从合约名解析到期日 (格式: 260731 -> 2026-07-31)
+        dte = 0
+        if len(parts) >= 2:
+            try:
+                exp_str = parts[1]  # e.g. "260731"
+                exp_date = datetime.strptime(exp_str, "%y%m%d").date()
+                dte = (exp_date - datetime.now().date()).days
+            except (ValueError, IndexError):
+                dte = 0
 
-        # 浮亏比例 (相对权利金)
-        premium_collected = entry * abs_qty
-        loss_ratio = (mark - entry) / entry if entry > 0 else 0
+        # Theta: 从 mark price API 的 Greeks 获取
+        theta = 0.0
+        m = marks.get(sym, {})
+        if m:
+            theta = abs(float(m.get("theta", 0)))
 
         # 距行权价距离
         dist_to_strike = (spot - strike) / spot * 100 if spot > 0 else 0
+
+        # 盈亏计算 (方向不同)
+        if is_short:
+            # 卖出: entry > mark 则盈利
+            pnl = (entry - mark) * abs_qty
+            premium_collected = entry * abs_qty
+            loss_ratio = (mark - entry) / entry if entry > 0 else 0
+            theta_income = round(theta * abs_qty, 2)  # 卖方: theta 是收入
+            pos_direction = "Short"
+        else:
+            # 买入: mark > entry 则盈利
+            pnl = (mark - entry) * abs_qty
+            premium_collected = entry * abs_qty  # 买方: 这是支出的权利金
+            loss_ratio = (entry - mark) / entry if entry > 0 else 0  # 买方: mark 下跌则亏
+            theta_income = round(-theta * abs_qty, 2)  # 买方: theta 是损耗 (负数)
+            pos_direction = "Long"
 
         info = {
             "type": "POSITION",
@@ -633,32 +710,48 @@ def monitor_positions(api: BinanceOptionsAPI, data: dict) -> list[dict]:
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl / premium_collected * 100, 1) if premium_collected > 0 else 0,
             "dist_to_strike": round(dist_to_strike, 1),
+            "dte": dte,
+            "theta": theta_income,
+            "premium_collected": round(premium_collected, 2),
+            "direction": pos_direction,  # "Short" 或 "Long"
         }
 
-        # 预警判断 (严格风控)
+        # 预警判断
         alert_level = "OK"
         msgs = []
 
-        if loss_ratio > 0:
-            msgs.append(f"浮亏 {loss_ratio:.1f}x 权利金")
+        if is_short:
+            # --- 卖出 Put 的风控 (原有逻辑) ---
+            if loss_ratio > 0:
+                msgs.append(f"浮亏 {loss_ratio:.1f}x 权利金")
 
-        if loss_ratio >= cfg.LOSS_ALERT_RATIO:
-            alert_level = "DANGER"
-            msgs.append("建议立即平仓止损!")
-        elif loss_ratio >= cfg.LOSS_WARN_RATIO:
-            alert_level = "WARNING"
-            msgs.append("接近止损线")
-
-        if dist_to_strike < cfg.DIST_STRIKE_ALERT:
-            alert_level = "DANGER"
-            msgs.append(f"距行权价仅 {dist_to_strike:.1f}%! 极度危险")
-        elif dist_to_strike < cfg.DIST_STRIKE_WARN:
-            if alert_level != "DANGER":
+            if loss_ratio >= cfg.LOSS_ALERT_RATIO:
+                alert_level = "DANGER"
+                msgs.append("建议立即平仓止损!")
+            elif loss_ratio >= cfg.LOSS_WARN_RATIO:
                 alert_level = "WARNING"
-            msgs.append(f"距行权价 {dist_to_strike:.1f}%, 注意风险")
+                msgs.append("接近止损线")
 
-        if alert_level == "OK":
-            msgs = [f"浮盈 {-loss_ratio:.0%}  距行权 {dist_to_strike:.1f}%"]
+            if dist_to_strike < cfg.DIST_STRIKE_ALERT:
+                alert_level = "DANGER"
+                msgs.append(f"距行权价仅 {dist_to_strike:.1f}%! 极度危险")
+            elif dist_to_strike < cfg.DIST_STRIKE_WARN:
+                if alert_level != "DANGER":
+                    alert_level = "WARNING"
+                msgs.append(f"距行权价 {dist_to_strike:.1f}%, 注意风险")
+
+            if alert_level == "OK":
+                msgs = [f"浮盈 {-loss_ratio:.0%}  距行权 {dist_to_strike:.1f}%"]
+        else:
+            # --- 买入 Put 的风控 (保护性仓位, 风控较宽松) ---
+            if pnl > 0:
+                msgs.append(f"浮盈 ${pnl:,.0f} ({info['pnl_pct']:+.0f}%)")
+            elif loss_ratio > 0.8:
+                # 买入的 Put 亏了 80% 以上, 基本归零
+                alert_level = "WATCH"
+                msgs.append(f"权利金已损耗 {loss_ratio:.0%}，接近归零")
+            else:
+                msgs.append(f"权利金损耗 {loss_ratio:.0%}")
 
         info["alert"] = alert_level
         info["msg"] = " | ".join(msgs)

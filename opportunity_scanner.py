@@ -20,6 +20,7 @@ import math
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from margin_calc import calc_put_margin_per_contract, calc_put_margin
 
 
 # ============================================================
@@ -133,10 +134,8 @@ def assess_account_risk(api, data: dict) -> AccountRisk:
         vega = float(m.get("vega", 0))
         theta = float(m.get("theta", 0))
 
-        # 保证金估算
-        otm_amount = max(spot - strike, 0)
-        margin = max(spot * cfg.MARGIN_RATE - otm_amount,
-                     spot * 0.075) * abs_qty
+        # 保证金估算 (统一公式)
+        margin = calc_put_margin(spot, strike, abs_qty)
 
         # 卖 Put: delta 为负, qty 为负, 组合 delta = delta * |qty| (正数=看多暴露)
         if qty < 0:
@@ -265,7 +264,7 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         # 核心指标
         breakeven = strike - bid
         safety_pct = (spot - breakeven) / spot * 100 if spot > 0 else 0
-        margin_1 = max(spot * cfg.MARGIN_RATE - max(spot - strike, 0), spot * 0.075)
+        margin_1 = calc_put_margin_per_contract(spot, strike)
         annual_return = (bid / margin_1) * (365 / dte) * 100 if margin_1 > 0 else 0
 
         exp_key = sym.split("-")[1]
