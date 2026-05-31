@@ -20,7 +20,10 @@ import time
 import math
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from margin_calc import calc_put_margin
+from margin_calc import (
+    calc_put_margin, calc_maint_margin,
+    stress_test_portfolio, estimate_liquidation_price, StressResult,
+)
 
 
 # ============================================================
@@ -200,8 +203,108 @@ class RiskEngine:
         # 3. 仓位集中度检查 (跨持仓)
         alerts.extend(self._check_concentration(positions, spot))
 
+        # 4. 组合级强平价格和压力测试 (需要 account_balance)
+        account_balance = data.get("account_balance", 0)
+        if account_balance > 0 and positions:
+            alerts.extend(self._check_liquidation(positions, marks, spot, account_balance))
+
         # 按严重程度排序
         alerts.sort(key=lambda a: a.level_rank, reverse=True)
+
+        return alerts
+
+    def _build_position_list(self, positions: list, marks: dict, spot: float) -> list[dict]:
+        """将 API 持仓数据转换为压力测试所需格式"""
+        result = []
+        for pos in positions:
+            qty = float(pos.get("quantity", 0))
+            if qty == 0 or "-P" not in pos.get("symbol", ""):
+                continue
+
+            sym = pos["symbol"]
+            strike = float(pos.get("strikePrice", 0))
+            entry = float(pos.get("entryPrice", 0))
+            expiry_ts = int(pos.get("expiryDate", 0))
+
+            mark = marks.get(sym, {})
+            mark_price = float(mark.get("markPrice", 0) or pos.get("markPrice", 0))
+            iv = float(mark.get("markIV", 0))
+
+            dte = 30  # 默认
+            if expiry_ts > 0:
+                _now = datetime.now(timezone.utc)
+                _expiry = datetime.fromtimestamp(expiry_ts / 1000, tz=timezone.utc)
+                dte = max((_expiry - _now).total_seconds() / 86400, 0.01)
+
+            result.append({
+                "symbol": sym,
+                "qty": qty,
+                "strike": strike,
+                "entry_price": entry,
+                "mark_price": mark_price,
+                "dte": dte,
+                "iv": iv if iv > 0 else 0.40,
+            })
+        return result
+
+    def _check_liquidation(self, positions: list, marks: dict,
+                           spot: float, account_balance: float) -> list[RiskAlert]:
+        """组合级: 强平价格估算 + 压力测试"""
+        alerts = []
+        pos_list = self._build_position_list(positions, marks, spot)
+        if not pos_list:
+            return alerts
+
+        # 估算强平价格
+        liq = estimate_liquidation_price(pos_list, spot, account_balance)
+        liq_price = liq["liq_price"]
+        liq_drop = liq["liq_drop_pct"]
+        cushion = liq["cushion"]
+
+        # 保存最新结果供 /risk 命令使用
+        self._last_liq = liq
+        self._last_stress = None
+
+        if liq_price > 0 and liq_drop > -100:
+            if liq_drop > -15:
+                alerts.append(RiskAlert(
+                    level="CRITICAL", category="MARGIN", symbol="PORTFOLIO",
+                    title=f"预估强平价 ${liq_price:,.0f} (仅跌 {abs(liq_drop):.0f}%)",
+                    detail=f"BTC 从 ${spot:,.0f} 跌到 ${liq_price:,.0f} 时保证金不足\n"
+                           f"当前安全垫 ${cushion:,.0f}",
+                    action="强平距离太近! 立即减仓或追加保证金",
+                ))
+            elif liq_drop > -25:
+                alerts.append(RiskAlert(
+                    level="DANGER", category="MARGIN", symbol="PORTFOLIO",
+                    title=f"预估强平价 ${liq_price:,.0f} (跌 {abs(liq_drop):.0f}%)",
+                    detail=f"BTC 跌到 ${liq_price:,.0f} 时保证金不足\n"
+                           f"当前安全垫 ${cushion:,.0f}",
+                    action="强平距离偏近, 考虑减少仓位或追加资金",
+                ))
+            elif liq_drop > -40:
+                alerts.append(RiskAlert(
+                    level="WARNING", category="MARGIN", symbol="PORTFOLIO",
+                    title=f"预估强平价 ${liq_price:,.0f} (跌 {abs(liq_drop):.0f}%)",
+                    detail=f"安全垫 ${cushion:,.0f}",
+                    action="关注 BTC 走势",
+                ))
+
+        # 压力测试 (关键场景)
+        stress = stress_test_portfolio(pos_list, spot, account_balance,
+                                       scenarios=[-10, -20, -30])
+        self._last_stress = stress
+
+        for sr in stress:
+            if sr.margin_shortfall > 0:
+                level = "DANGER" if sr.btc_drop_pct >= -20 else "WARNING"
+                alerts.append(RiskAlert(
+                    level=level, category="MARGIN", symbol="PORTFOLIO",
+                    title=f"压力测试: BTC{sr.scenario} 保证金缺口 ${sr.margin_shortfall:,.0f}",
+                    detail=f"BTC ${sr.btc_price:,.0f} → 组合亏 ${abs(sr.total_pnl):,.0f}\n"
+                           f"需保证金 ${sr.total_margin_required:,.0f} vs 净值 ${sr.account_equity:,.0f}",
+                    action="该场景下会被强平",
+                ))
 
         return alerts
 
@@ -576,57 +679,115 @@ class RiskEngine:
 # ============================================================
 #  风控消息格式化
 # ============================================================
-def format_risk_alerts(alerts: list[RiskAlert], full: bool = False) -> str:
-    """格式化风控告警消息"""
-    if not alerts:
-        return "🛡️ <b>风控状态: 一切正常</b> ✅"
-
-    # 按级别分组
-    critical = [a for a in alerts if a.level == "CRITICAL"]
-    danger = [a for a in alerts if a.level == "DANGER"]
-    warning = [a for a in alerts if a.level == "WARNING"]
-    watch = [a for a in alerts if a.level == "WATCH"]
-
+def format_risk_alerts(alerts: list[RiskAlert], full: bool = False,
+                       risk_engine=None, spot: float = 0) -> str:
+    """格式化风控告警消息 (含完整仪表盘)"""
     lines = ["🛡️ <b>风控报告</b>"]
     lines.append("")
 
-    # 总览
-    if critical:
-        lines.append(f"🚨 极度危险: {len(critical)} 项")
-    if danger:
-        lines.append(f"🔴 危险: {len(danger)} 项")
-    if warning:
-        lines.append(f"⚠️ 警告: {len(warning)} 项")
-    if watch and full:
-        lines.append(f"👀 关注: {len(watch)} 项")
-    lines.append("")
+    if not alerts:
+        lines.append("✅ 所有指标正常, 无需操作")
+    else:
+        # 按级别分组
+        critical = [a for a in alerts if a.level == "CRITICAL"]
+        danger = [a for a in alerts if a.level == "DANGER"]
+        warning = [a for a in alerts if a.level == "WARNING"]
+        watch = [a for a in alerts if a.level == "WATCH"]
 
-    # 详细信息
-    for a in critical:
-        lines.append(f"🚨 <b>[极危] {a.title}</b>")
-        lines.append(f"  {a.detail}")
-        if a.action:
-            lines.append(f"  → <b>{a.action}</b>")
+        # 总览
+        if critical:
+            lines.append(f"🚨 极度危险: {len(critical)} 项")
+        if danger:
+            lines.append(f"🔴 危险: {len(danger)} 项")
+        if warning:
+            lines.append(f"⚠️ 警告: {len(warning)} 项")
+        if watch and full:
+            lines.append(f"👀 关注: {len(watch)} 项")
         lines.append("")
 
-    for a in danger:
-        lines.append(f"🔴 <b>[危险] {a.title}</b>")
-        lines.append(f"  {a.detail}")
-        if a.action:
-            lines.append(f"  → {a.action}")
-        lines.append("")
-
-    for a in warning:
-        lines.append(f"⚠️ [警告] {a.title}")
-        lines.append(f"  {a.detail}")
-        if a.action:
-            lines.append(f"  → {a.action}")
-        lines.append("")
-
-    if full:
-        for a in watch:
-            lines.append(f"👀 [关注] {a.title}")
+        # 详细信息
+        for a in critical:
+            lines.append(f"🚨 <b>[极危] {a.title}</b>")
             lines.append(f"  {a.detail}")
+            if a.action:
+                lines.append(f"  → <b>{a.action}</b>")
+            lines.append("")
+
+        for a in danger:
+            lines.append(f"🔴 <b>[危险] {a.title}</b>")
+            lines.append(f"  {a.detail}")
+            if a.action:
+                lines.append(f"  → {a.action}")
+            lines.append("")
+
+        for a in warning:
+            lines.append(f"⚠️ [警告] {a.title}")
+            lines.append(f"  {a.detail}")
+            if a.action:
+                lines.append(f"  → {a.action}")
+            lines.append("")
+
+        if full:
+            for a in watch:
+                lines.append(f"👀 [关注] {a.title}")
+                lines.append(f"  {a.detail}")
+                lines.append("")
+
+    # ===== 风控仪表盘: 强平价 + 压力测试 =====
+    if risk_engine and full:
+        liq = getattr(risk_engine, "_last_liq", None)
+        stress = getattr(risk_engine, "_last_stress", None)
+
+        if liq and liq.get("liq_price", 0) > 0:
+            lines.append("━" * 35)
+            lines.append("<b>💀 预估强平价格</b>")
+            liq_price = liq["liq_price"]
+            liq_drop = liq["liq_drop_pct"]
+            cushion = liq["cushion"]
+
+            if liq_drop > -15:
+                liq_icon = "🚨"
+            elif liq_drop > -25:
+                liq_icon = "🔴"
+            elif liq_drop > -40:
+                liq_icon = "⚠️"
+            else:
+                liq_icon = "🟢"
+
+            lines.append(
+                f"  {liq_icon} BTC 跌到 <b>${liq_price:,.0f}</b> 时保证金不足"
+            )
+            lines.append(
+                f"  距当前 {abs(liq_drop):.0f}% (${spot - liq_price:,.0f})"
+            )
+            lines.append(
+                f"  当前安全垫: ${cushion:,.0f}"
+            )
+            lines.append("")
+
+            # 各仓位在强平时的状态
+            if liq.get("details"):
+                lines.append("  <b>强平时各仓位:</b>")
+                for d in liq["details"]:
+                    short_sym = d["symbol"].split("BTC-")[-1]
+                    lines.append(
+                        f"  {short_sym}: 期权价 ${d['stressed_price']:,.0f}  "
+                        f"亏 ${abs(d['pnl']):,.0f}"
+                    )
+                lines.append("")
+
+        if stress:
+            lines.append("━" * 35)
+            lines.append("<b>📉 压力测试</b>")
+            lines.append(f"{'场景':<12} {'BTC价格':>10} {'组合PnL':>10} {'保证金缺口':>10}")
+            for sr in stress:
+                shortfall = f"${sr.margin_shortfall:,.0f}" if sr.margin_shortfall > 0 else "✅"
+                pnl_str = f"${sr.total_pnl:+,.0f}"
+                status = "💀" if sr.margin_shortfall > 0 else "✅"
+                lines.append(
+                    f"  {status} {sr.scenario:<8} ${sr.btc_price:>8,.0f}  "
+                    f"{pnl_str:>10}  {shortfall:>10}"
+                )
             lines.append("")
 
     return "\n".join(lines)

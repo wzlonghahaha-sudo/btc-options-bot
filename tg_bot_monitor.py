@@ -896,13 +896,28 @@ class MonitorService:
         pos_alerts = monitor_positions(self.api, data)
         order_alerts = monitor_open_orders(self.api, data)
 
-        # 风控检查
+        # v2 机会扫描 (每次都做, 需要 account_risk 给风控用)
+        v2_opportunities = []
+        account_risk = None
+        hv_20 = 0
+        try:
+            account_risk = assess_account_risk(self.api, data)
+            hv_20 = self.vol_analyzer.calc_hv(20)
+            v2_opportunities = scan_all_opportunities(data, iv_surface, account_risk, hv_20)
+        except Exception as e:
+            log.error(f"v2机会扫描失败: {e}")
+
+        # 风控检查 (含强平价格估算, 需要 account_balance)
         try:
             positions = self.api.get_position()
+            account_balance = 0
+            if account_risk:
+                account_balance = account_risk.available_margin + account_risk.used_margin
             risk_data = {
                 "spot": data["spot"],
                 "marks": data["marks"],
                 "positions": [p for p in positions if float(p.get("quantity", 0)) != 0],
+                "account_balance": account_balance,
             }
             risk_alerts = self.risk_engine.check_all(risk_data)
         except Exception as e:
@@ -910,7 +925,6 @@ class MonitorService:
             risk_alerts = []
 
         # P1-6: 止盈分析频率自适应
-        # 波动市场(1分钟间隔)每3次, 常规市场每10次
         profit_interval = 3 if self.current_interval <= SCAN_INTERVAL_VOLATILE else 10
         profit_analysis = None
         if self.scan_count % profit_interval == 0 or self.scan_count <= 1:
@@ -921,17 +935,6 @@ class MonitorService:
                 )
             except Exception as e:
                 log.error(f"收益优化分析失败: {e}")
-
-        # v2 机会扫描 (每次都做, 用于信号推送)
-        v2_opportunities = []
-        account_risk = None
-        hv_20 = 0
-        try:
-            account_risk = assess_account_risk(self.api, data)
-            hv_20 = self.vol_analyzer.calc_hv(20)
-            v2_opportunities = scan_all_opportunities(data, iv_surface, account_risk, hv_20)
-        except Exception as e:
-            log.error(f"v2机会扫描失败: {e}")
 
         scan_time = time.time() - t0
         self.scan_count += 1
@@ -1369,7 +1372,11 @@ class MonitorService:
             elif text == "/risk":
                 if self.last_result:
                     risk = self.last_result.get("risk_alerts", [])
-                    msg = format_risk_alerts(risk, full=True)
+                    spot = self.last_result["data"]["spot"]
+                    msg = format_risk_alerts(
+                        risk, full=True,
+                        risk_engine=self.risk_engine, spot=spot,
+                    )
                     self.tg.send(msg)
                 else:
                     self.tg.send("⏳ 尚未完成首次扫描")
