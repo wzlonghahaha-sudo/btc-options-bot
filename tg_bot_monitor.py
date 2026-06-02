@@ -59,6 +59,7 @@ from opportunity_scanner import (
 from ai_analyst import SmartAnalyst
 from trade_journal import TradeJournal, SignalRecord
 from state_persistence import StatePersistence
+from hedge_advisor import HedgeAdvisor, RiskMode
 
 load_dotenv()
 
@@ -357,7 +358,8 @@ class MessageFormatter:
                         order_alerts: list = None,
                         risk_alerts: list = None,
                         account_risk=None,
-                        btc_24h_change: float = None) -> str:
+                        btc_24h_change: float = None,
+                        liq_line: str = "") -> str:
         """格式化市场概览 (含 IV 警告、信号展开、持仓详情、保证金)"""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         mean_iv = iv_surface["global"]["mean"]
@@ -426,9 +428,11 @@ class MessageFormatter:
                     f"DTE {r['dte']:.0f}天"
                 )
 
-        # --- 风控 + P1-5: 保证金使用率 ---
+        # --- 风控 + 强平价 + 保证金 ---
         lines.append("")
         lines.append(format_risk_summary(risk_alerts or [], spot))
+        if liq_line:
+            lines.append(liq_line)
 
         if account_risk and account_risk.total_balance > 0:
             usage_pct = account_risk.margin_usage_pct
@@ -567,6 +571,7 @@ class MessageFormatter:
             "/top70 - ⭐ 看70+以上机会\n"
             "/overview - 发送完整市场概览\n"
             "/ai - 🤖 AI 策略分析 (Claude)\n"
+            "/hedge - 🛡️ 对冲方案计算\n"
             "/perf - 📊 策略绩效统计\n"
             "/journal - 📝 最近交易记录\n"
             "/strategy - 📖 策略说明 (小白版)\n"
@@ -784,6 +789,8 @@ class MonitorService:
         self.ai_analyst = SmartAnalyst()
         self.journal = TradeJournal()
         self.state = StatePersistence()
+        self.hedge_advisor = HedgeAdvisor()
+        self.risk_mode = RiskMode()
 
         self.scan_count = 0
         self.start_time = time.time()
@@ -792,6 +799,7 @@ class MonitorService:
         self.last_overview_time = 0
         self.current_interval = SCAN_INTERVAL_NORMAL
         self.last_result = None
+        self.last_pos_list = []  # 压力测试用的持仓列表
 
         self.running = True
         self.update_offset = 0
@@ -908,21 +916,56 @@ class MonitorService:
             log.error(f"v2机会扫描失败: {e}")
 
         # 风控检查 (含强平价格估算, 需要 account_balance)
+        # 优先用币安 marginAccount 的真实 marginBalance
+        account_balance = 0
         try:
-            positions = self.api.get_position()
-            account_balance = 0
+            ma = self.api._get("/eapi/v1/marginAccount", signed=True)
+            account_balance = float(ma["asset"][0]["marginBalance"])
+        except Exception:
             if account_risk:
                 account_balance = account_risk.available_margin + account_risk.used_margin
+
+        try:
+            positions = self.api.get_position()
+            active_positions = [p for p in positions if float(p.get("quantity", 0)) != 0]
             risk_data = {
                 "spot": data["spot"],
                 "marks": data["marks"],
-                "positions": [p for p in positions if float(p.get("quantity", 0)) != 0],
+                "positions": active_positions,
                 "account_balance": account_balance,
             }
             risk_alerts = self.risk_engine.check_all(risk_data)
         except Exception as e:
             log.error(f"风控检查失败: {e}")
             risk_alerts = []
+            active_positions = []
+
+        # 对冲顾问: 追踪强平价 + 检查对冲仓位到期
+        try:
+            pos_list = self.risk_engine._build_position_list(
+                active_positions, data["marks"], data["spot"])
+            self.last_pos_list = pos_list
+
+            liq = self.hedge_advisor.update_liquidation(
+                pos_list, data["spot"], account_balance)
+
+            # 风控模式切换
+            old_mode = self.risk_mode.mode
+            self.risk_mode.update(liq["liq_drop_pct"])
+            if self.risk_mode.mode_changed():
+                self.tg.broadcast(
+                    f"🔔 <b>风控模式切换</b>\n"
+                    f"{old_mode} → <b>{self.risk_mode.mode_icon}</b>\n"
+                    f"强平距离 {abs(liq['liq_drop_pct']):.0f}%",
+                )
+
+            # 对冲仓位到期提醒
+            expiry_alerts = self.hedge_advisor.check_hedge_expiry(pos_list)
+            for ea in expiry_alerts:
+                self.tg.broadcast(ea["msg"])
+
+        except Exception as e:
+            log.error(f"对冲顾问失败: {e}")
 
         # P1-6: 止盈分析频率自适应
         profit_interval = 3 if self.current_interval <= SCAN_INTERVAL_VOLATILE else 10
@@ -961,6 +1004,7 @@ class MonitorService:
             "profit_analysis": profit_analysis,
             "v2_opportunities": v2_opportunities,
             "account_risk": account_risk,
+            "account_balance": account_balance,
             "hv_20": hv_20,
             "scan_time": scan_time,
         }
@@ -1073,7 +1117,12 @@ class MonitorService:
         - 78+分: 主动推送完整详情
         - <78分: 不推送, 用户通过 /top 自行查看
         - 去重: 1小时内同一合约不重复推送
+        - 危机模式下抑制: 不推送新开仓信号
         """
+        # 危机模式: 不推送新开仓信号
+        if self.risk_mode.should_suppress_signals:
+            return
+
         opps = result.get("v2_opportunities", [])
         account = result.get("account_risk")
         if not opps or not account:
@@ -1185,6 +1234,19 @@ class MonitorService:
         except Exception:
             pass
 
+        # 强平价一行 (如果有数据)
+        liq_line = ""
+        try:
+            if self.last_pos_list and self.hedge_advisor.last_liq_price > 0:
+                liq_data = {
+                    "liq_price": self.hedge_advisor.last_liq_price,
+                    "liq_drop_pct": self.hedge_advisor.last_liq_drop,
+                    "cushion": getattr(self.risk_engine, "_last_liq", {}).get("cushion", 0),
+                }
+                liq_line = self.hedge_advisor.format_liq_line(liq_data, result["data"]["spot"])
+        except Exception:
+            pass
+
         msg = self.fmt.market_overview(
             result["data"]["spot"],
             result["iv_surface"],
@@ -1195,6 +1257,7 @@ class MonitorService:
             risk_alerts=result.get("risk_alerts", []),
             account_risk=result.get("account_risk"),
             btc_24h_change=btc_24h_change,
+            liq_line=liq_line,
         )
         self.tg.broadcast(msg, silent=True)
         self.last_overview_time = time.time()
@@ -1483,6 +1546,59 @@ class MonitorService:
                 else:
                     self.tg.send("⏳ 尚未完成首次扫描")
 
+            elif text == "/hedge":
+                if self.last_result and self.last_pos_list:
+                    self.tg.send("🛡️ 计算对冲方案...")
+                    try:
+                        spot = self.last_result["data"]["spot"]
+                        try:
+                            ma = self.api._get("/eapi/v1/marginAccount", signed=True)
+                            balance = float(ma["asset"][0]["marginBalance"])
+                        except Exception:
+                            balance = 0
+
+                        if balance <= 0:
+                            self.tg.send("❌ 无法获取账户余额")
+                        else:
+                            available_puts = self._get_hedge_candidates(self.last_result["data"])
+                            hedge_calc = self.hedge_advisor.calc_hedge_options(
+                                self.last_pos_list, spot, balance, available_puts)
+
+                            liq = hedge_calc["liq_current"]
+                            lines = ["🛡️ <b>对冲方案</b>\n"]
+                            lines.append(f"BTC ${spot:,.0f}  余额 ${balance:,.0f}")
+                            lines.append(f"强平价 ${liq['liq_price']:,.0f} (跌 {abs(liq['liq_drop_pct']):.0f}%)")
+                            lines.append(f"模式: {self.risk_mode.mode_icon}\n")
+
+                            # 补保证金 vs 买 Put
+                            comp = hedge_calc.get("comparison", {})
+                            if comp:
+                                lines.append("<b>$1,000 对比:</b>")
+                                lines.append(f"  补保证金 → 下移 ${comp['cash_1k_improve']:,.0f}")
+                                lines.append(f"  买 Put   → 下移 ${comp['best_put_1k_improve']:,.0f}")
+                                lines.append(f"  效率: 买Put = <b>{comp['ratio']:.0f}x</b>\n")
+
+                            # 各预算最优
+                            best = hedge_calc.get("best_by_budget", {})
+                            if best:
+                                lines.append("<b>推荐方案:</b>")
+                                for budget in [500, 1000, 2000, 3000]:
+                                    b = best.get(budget)
+                                    if not b:
+                                        continue
+                                    short_sym = b["symbol"].split("BTC-")[-1]
+                                    lines.append(
+                                        f"  ${budget:,}: {short_sym} ×{b['qty']:.1f}张"
+                                        f" @ ${b['ask']:,.0f}"
+                                        f" → 强平 ${b['liq_price']:,.0f}"
+                                        f" (跌{abs(b['liq_drop']):.0f}%)"
+                                    )
+                            self.tg.send("\n".join(lines))
+                    except Exception as e:
+                        self.tg.send(f"❌ 对冲计算失败: {e}")
+                else:
+                    self.tg.send("⏳ 尚未完成首次扫描")
+
             elif text == "/perf":
                 msg = self.journal.format_performance_tg()
                 self.tg.send(msg)
@@ -1519,6 +1635,84 @@ class MonitorService:
                             f"{hit['acted_on']}条入场 ({hit['hit_rate']:.0f}%)"
                         )
                     self.tg.send("\n".join(lines))
+
+    def _process_hedge_alerts(self, result: dict):
+        """检查是否需要推送对冲建议"""
+        try:
+            liq = self.hedge_advisor.update_liquidation(
+                self.last_pos_list, result["data"]["spot"],
+                result.get("account_balance", 0)
+            ) if self.last_pos_list else None
+
+            if not liq or not self.hedge_advisor.should_push_hedge(liq):
+                return
+
+            # 获取可买的 Put 候选
+            available_puts = self._get_hedge_candidates(result["data"])
+            if not available_puts:
+                return
+
+            spot = result["data"]["spot"]
+            account_balance = result.get("account_balance", 0)
+            if not account_balance:
+                try:
+                    ma = self.api._get("/eapi/v1/marginAccount", signed=True)
+                    account_balance = float(ma["asset"][0]["marginBalance"])
+                except Exception:
+                    return
+
+            hedge_calc = self.hedge_advisor.calc_hedge_options(
+                self.last_pos_list, spot, account_balance, available_puts)
+
+            msg = self.hedge_advisor.format_hedge_alert(liq, hedge_calc, spot)
+            self.tg.broadcast(msg)
+            log.info(f"推送对冲建议 (强平距离 {abs(liq['liq_drop_pct']):.0f}%)")
+
+        except Exception as e:
+            log.error(f"对冲建议推送失败: {e}")
+
+    def _get_hedge_candidates(self, data: dict) -> list:
+        """获取可买的 Put 对冲候选"""
+        candidates = []
+        try:
+            spot = data["spot"]
+            marks = data.get("marks", {})
+            tickers = self.api.get_ticker()
+            ticker_map = {t["symbol"]: t for t in tickers if t["symbol"].startswith("BTC")}
+            info = self.api.get_exchange_info()
+            contracts = {s["symbol"]: s for s in info["optionSymbols"]
+                         if s["underlying"] == "BTCUSDT"}
+            now = datetime.now(timezone.utc)
+
+            for sym, c in contracts.items():
+                if c.get("side") != "PUT":
+                    continue
+                strike = float(c["strikePrice"])
+                # 只看 OTM 到 slightly ITM
+                if strike < spot * 0.50 or strike > spot * 1.05:
+                    continue
+                exp = datetime.fromtimestamp(c["expiryDate"] / 1000, tz=timezone.utc)
+                dte = (exp - now).total_seconds() / 86400
+                if dte < 7 or dte > 120:
+                    continue
+
+                m = marks.get(sym, {})
+                t = ticker_map.get(sym, {})
+                ask = float(t.get("askPrice", 0))
+                iv = float(m.get("markIV", 0))
+                delta = float(m.get("delta", 0))
+
+                if ask <= 0:
+                    continue
+
+                candidates.append({
+                    "symbol": sym, "strike": strike, "dte": round(dte),
+                    "ask": ask, "iv": iv, "delta": delta,
+                })
+        except Exception as e:
+            log.error(f"获取对冲候选失败: {e}")
+
+        return candidates
 
     def _check_proactive_roll(self, result: dict):
         """P2-8: 到期前主动 Roll 提醒"""
@@ -1615,6 +1809,16 @@ class MonitorService:
                 # v2 机会信号
                 self.process_v2_signals(result)
 
+                # 对冲建议推送 (基于强平距离)
+                self._process_hedge_alerts(result)
+
+                # 风控模式控制扫描间隔
+                mode_interval = self.risk_mode.scan_interval
+                if mode_interval != self.current_interval:
+                    self.current_interval = mode_interval
+                    log.info(f"扫描间隔调整为 {self.current_interval}s (模式: {self.risk_mode.mode})")
+
+                # 危机模式下抑制新开仓信号 (已在 process_v2_signals 之后)
                 # P2-8: 到期前主动 Roll 提醒 (DTE < 21 + 盈利 > 30%)
                 self._check_proactive_roll(result)
 

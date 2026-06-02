@@ -597,8 +597,8 @@ class RiskEngine:
                 detail=f"行权价 ${strike:,.0f}",
             ))
 
-        # === 3. 保证金 / 爆仓估算 (统一公式) ===
-        margin_est = calc_put_margin(spot, strike, abs_qty)
+        # === 3. 保证金 / 爆仓估算 (统一公式, 含 mark_price) ===
+        margin_est = calc_put_margin(spot, strike, abs_qty, mark_price)
 
         # 保证金使用率 ≈ 当前持仓市值 / 保证金
         margin_usage = mark_price * abs_qty / margin_est if margin_est > 0 else 0
