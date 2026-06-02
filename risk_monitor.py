@@ -188,28 +188,107 @@ class RiskEngine:
         # 1. BTC 市场波动检查
         alerts.extend(self._check_btc_move(spot))
 
-        # 2. 逐个持仓检查
+        # 2. 计算组合级 Greeks (供单仓检查参考)
         positions = data.get("positions", [])
         marks = data.get("marks", {})
+        portfolio_ctx = self._calc_portfolio_greeks(positions, marks)
 
+        # 3. 逐个持仓检查 (传入组合上下文)
         for pos in positions:
             qty = float(pos.get("quantity", 0))
             if qty == 0:
                 continue
             sym = pos["symbol"]
             mark = marks.get(sym, {})
-            alerts.extend(self._check_position(pos, mark, spot))
+            alerts.extend(self._check_position(pos, mark, spot, portfolio_ctx))
 
-        # 3. 仓位集中度检查 (跨持仓)
+        # 4. 组合级 Greeks 告警 (用净 delta 而非单仓)
+        alerts.extend(self._check_portfolio_greeks(portfolio_ctx, spot))
+
+        # 5. 仓位集中度检查 (跨持仓)
         alerts.extend(self._check_concentration(positions, spot))
 
-        # 4. 组合级强平价格和压力测试 (需要 account_balance)
+        # 6. 组合级强平价格和压力测试 (需要 account_balance)
         account_balance = data.get("account_balance", 0)
         if account_balance > 0 and positions:
             alerts.extend(self._check_liquidation(positions, marks, spot, account_balance))
 
         # 按严重程度排序
         alerts.sort(key=lambda a: a.level_rank, reverse=True)
+
+        return alerts
+
+    def _calc_portfolio_greeks(self, positions: list, marks: dict) -> dict:
+        """计算组合级 Greeks, 用于判断对冲后的净暴露"""
+        net_delta = 0       # 净 delta (正=看多暴露)
+        total_short_delta = 0
+        total_long_delta = 0
+        total_gamma = 0
+        total_vega = 0
+        total_theta = 0
+        has_long_put = False
+
+        for pos in positions:
+            qty = float(pos.get("quantity", 0))
+            if qty == 0 or "-P" not in pos.get("symbol", ""):
+                continue
+            sym = pos["symbol"]
+            m = marks.get(sym, {})
+            delta = float(m.get("delta", 0))
+            gamma = float(m.get("gamma", 0))
+            vega = float(m.get("vega", 0))
+            theta = float(m.get("theta", 0))
+            abs_qty = abs(qty)
+
+            if qty < 0:  # Short Put
+                contrib = abs(delta) * abs_qty  # 正数: 多头暴露
+                total_short_delta += contrib
+            else:  # Long Put
+                contrib = delta * qty  # 负数: 空头暴露 (对冲)
+                total_long_delta += abs(contrib)
+                has_long_put = True
+
+            net_delta += contrib
+            total_gamma += abs(gamma) * abs_qty
+            total_vega += abs(vega) * abs_qty
+            total_theta += theta * (1 if qty < 0 else -1) * abs_qty
+
+        return {
+            "net_delta": net_delta,
+            "total_short_delta": total_short_delta,
+            "total_long_delta": total_long_delta,
+            "hedged_delta": total_long_delta,  # Long Put 对冲掉的 delta
+            "total_gamma": total_gamma,
+            "total_vega": total_vega,
+            "total_theta": total_theta,
+            "has_long_put": has_long_put,
+        }
+
+    def _check_portfolio_greeks(self, ctx: dict, spot: float) -> list[RiskAlert]:
+        """组合级 Greeks 告警 — 基于净暴露而非单仓"""
+        alerts = []
+        cfg = self.cfg
+        net_delta = ctx["net_delta"]
+
+        # 组合净 Delta 告警 (用净 delta, 已扣除 Long Put 对冲)
+        if net_delta > cfg.DELTA_DANGER:
+            alerts.append(RiskAlert(
+                level="DANGER", category="GREEKS", symbol="PORTFOLIO",
+                title=f"组合净 Delta {net_delta:.3f}",
+                detail=f"Short Delta {ctx['total_short_delta']:.3f} - "
+                       f"Long Delta {ctx['total_long_delta']:.3f} = 净 {net_delta:.3f}\n"
+                       f"BTC 每跌 $1000, 组合亏约 ${net_delta * 1000:,.0f}",
+                action="净 Delta 暴露大, 考虑加仓 Long Put 或减仓",
+            ))
+        elif net_delta > cfg.DELTA_WARN:
+            alerts.append(RiskAlert(
+                level="WARNING", category="GREEKS", symbol="PORTFOLIO",
+                title=f"组合净 Delta {net_delta:.3f}",
+                detail=f"Short Delta {ctx['total_short_delta']:.3f} - "
+                       f"Long Delta {ctx['total_long_delta']:.3f} = 净 {net_delta:.3f}\n"
+                       f"BTC 每跌 $1000, 组合亏约 ${net_delta * 1000:,.0f}",
+                action="关注组合 delta 暴露",
+            ))
 
         return alerts
 
@@ -431,8 +510,9 @@ class RiskEngine:
 
         return alerts
 
-    def _check_position(self, pos: dict, mark: dict, spot: float) -> list[RiskAlert]:
-        """检查单个持仓的风险"""
+    def _check_position(self, pos: dict, mark: dict, spot: float,
+                        portfolio_ctx: dict = None) -> list[RiskAlert]:
+        """检查单个持仓的风险 (portfolio_ctx 提供组合级对冲信息)"""
         alerts = []
         cfg = self.cfg
 
@@ -453,6 +533,9 @@ class RiskEngine:
         # 只关注卖出的 Put
         if qty >= 0 or "-P" not in sym:
             return alerts
+
+        # 是否有 Long Put 对冲
+        has_hedge = portfolio_ctx.get("has_long_put", False) if portfolio_ctx else False
 
         # === 1. 浮亏检查 ===
         pnl = (entry - mark_price) * abs_qty
@@ -545,21 +628,56 @@ class RiskEngine:
 
         # === 4. 希腊值风险 ===
         abs_delta = abs(delta) * abs_qty
-        if abs_delta > cfg.DELTA_DANGER:
-            alerts.append(RiskAlert(
-                level="DANGER", category="GREEKS", symbol=sym,
-                title=f"Delta 暴露 {abs_delta:.3f}",
-                detail=f"已不是深度 OTM! Delta={delta:.4f} x {abs_qty}张\n"
-                       f"BTC 每跌 $1000, 你亏约 ${abs_delta * 1000:,.0f}",
-                action="Delta 太大, 考虑平仓或对冲",
-            ))
-        elif abs_delta > cfg.DELTA_WARN:
-            alerts.append(RiskAlert(
-                level="WARNING", category="GREEKS", symbol=sym,
-                title=f"Delta 偏大 {abs_delta:.3f}",
-                detail=f"Delta={delta:.4f}, 不再是安全的深度 OTM",
-                action="注意: BTC 继续下跌会导致 delta 加速增大",
-            ))
+
+        # 如果有 Long Put 对冲, 单仓 Delta 告警降级
+        # DANGER/WARNING 由组合级 _check_portfolio_greeks 统一报, 避免重复
+        if has_hedge and portfolio_ctx:
+            net_delta = portfolio_ctx.get("net_delta", abs_delta)
+            if abs_delta > cfg.DELTA_DANGER:
+                # 有对冲: 单仓最高只到 WARNING, DANGER 留给组合级
+                if net_delta > cfg.DELTA_WARN:
+                    level = "WARNING"
+                    hedge_note = f"\n(含 Long Put 对冲, 组合净 Delta={net_delta:.3f})"
+                else:
+                    level = "WATCH"
+                    hedge_note = f"\n(Long Put 已有效对冲, 净 Delta={net_delta:.3f})"
+                alerts.append(RiskAlert(
+                    level=level, category="GREEKS", symbol=sym,
+                    title=f"Delta {abs_delta:.3f} (净 {net_delta:.3f})",
+                    detail=f"单仓 Delta={delta:.4f} x {abs_qty}张 = {abs_delta:.3f}"
+                           f"{hedge_note}",
+                    action="关注组合净暴露" if level == "WARNING" else "",
+                ))
+            elif abs_delta > cfg.DELTA_WARN:
+                if net_delta <= cfg.DELTA_WARN:
+                    level = "WATCH"
+                    hedge_note = f"\n(Long Put 已对冲, 净 Delta={net_delta:.3f})"
+                else:
+                    level = "WARNING"
+                    hedge_note = f"\n(含 Long Put, 净 Delta={net_delta:.3f})"
+                alerts.append(RiskAlert(
+                    level=level, category="GREEKS", symbol=sym,
+                    title=f"Delta {abs_delta:.3f} (净 {net_delta:.3f})",
+                    detail=f"Delta={delta:.4f}{hedge_note}",
+                    action="关注组合净暴露" if level == "WARNING" else "",
+                ))
+        else:
+            # 无对冲: 原始逻辑
+            if abs_delta > cfg.DELTA_DANGER:
+                alerts.append(RiskAlert(
+                    level="DANGER", category="GREEKS", symbol=sym,
+                    title=f"Delta 暴露 {abs_delta:.3f}",
+                    detail=f"已不是深度 OTM! Delta={delta:.4f} x {abs_qty}张\n"
+                           f"BTC 每跌 $1000, 你亏约 ${abs_delta * 1000:,.0f}",
+                    action="Delta 太大, 考虑平仓或对冲",
+                ))
+            elif abs_delta > cfg.DELTA_WARN:
+                alerts.append(RiskAlert(
+                    level="WARNING", category="GREEKS", symbol=sym,
+                    title=f"Delta 偏大 {abs_delta:.3f}",
+                    detail=f"Delta={delta:.4f}, 不再是安全的深度 OTM",
+                    action="注意: BTC 继续下跌会导致 delta 加速增大",
+                ))
 
         # 提前计算 DTE (Gamma 和到期风险都要用)
         dte = 999
