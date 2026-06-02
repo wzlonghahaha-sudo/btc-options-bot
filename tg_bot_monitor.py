@@ -964,6 +964,14 @@ class MonitorService:
             for ea in expiry_alerts:
                 self.tg.broadcast(ea["msg"])
 
+            # 对冲止盈/退出检查 (每 5 次扫描检查一次)
+            if self.scan_count % 5 == 0 or self.scan_count <= 1:
+                exit_alerts = self.hedge_advisor.check_hedge_exit(
+                    pos_list, data["spot"], account_balance, data["marks"])
+                for ea in exit_alerts:
+                    self.tg.broadcast(ea["msg"])
+                    log.info(f"对冲止盈提醒: {ea['short_sym']} ({ea['reason']})")
+
         except Exception as e:
             log.error(f"对冲顾问失败: {e}")
 

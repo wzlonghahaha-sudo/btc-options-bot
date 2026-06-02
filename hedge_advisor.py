@@ -272,6 +272,134 @@ class HedgeAdvisor:
 
         return f"{icon} 强平 ${liq_price:,.0f} (跌{drop:.0f}%) 垫 ${liq['cushion']:,.0f}"
 
+    def check_hedge_exit(self, pos_list: list, spot: float,
+                         account_balance: float, marks: dict) -> list[dict]:
+        """
+        检查对冲仓位是否应该平掉 (止盈/保护不再需要)
+
+        退出条件 (满足任一即提醒):
+
+        1. 盈利锁定: 对冲 Put 盈利 > 80%, 剩余上行空间有限
+           → BTC 继续跌的概率已被充分反映在价格中, 获利了结
+
+        2. 风险解除: 强平距离已恢复到 > 50% (含对冲), 去掉对冲后仍 > 40%
+           → BTC 反弹足够多, 保护不再紧迫, 对冲成本变成纯损耗
+
+        3. Theta 损耗过快: 日损耗 > 对冲剩余价值的 8% (约 12 天耗尽)
+           → 时间价值加速衰减, 继续持有不划算
+
+        4. 价值归零: 对冲 Put 剩余价值 < $50 且 DTE < 10
+           → 几乎没有保护作用了, 还不如卖掉残值
+
+        5. Short Put 已平: 被保护的 Short Put 已经平仓了
+           → 对冲对象不存在了, 保护没有意义
+
+        NOT退出: 强平距离 < 35% 时绝不建议平对冲 (还需要保护)
+
+        Returns: [{symbol, short_sym, reason, action, pnl_pct, mark, entry, dte}]
+        """
+        alerts = []
+        now = time.time()
+
+        # 拆分 Long / Short
+        long_puts = [p for p in pos_list if p.get("qty", 0) > 0]
+        short_puts = [p for p in pos_list if p.get("qty", 0) < 0]
+        short_strikes = {p["strike"] for p in short_puts}
+
+        if not long_puts:
+            return alerts
+
+        # 当前强平距离 (含对冲)
+        liq_with = estimate_liquidation_price(pos_list, spot, account_balance)
+        drop_with = abs(liq_with["liq_drop_pct"])
+
+        # 去掉对冲后的强平距离
+        liq_without = estimate_liquidation_price(short_puts, spot, account_balance)
+        drop_without = abs(liq_without["liq_drop_pct"])
+
+        for p in long_puts:
+            sym = p.get("symbol", "")
+            entry = p.get("entry_price", 0)
+            mark_p = p.get("mark_price", 0)
+            dte = p.get("dte", 999)
+            strike = p.get("strike", 0)
+            short_sym = sym.split("BTC-")[-1]
+
+            # 从 marks 获取实时 theta
+            m = marks.get(sym, {})
+            theta = abs(float(m.get("theta", 0)))
+
+            if entry <= 0 or mark_p <= 0:
+                continue
+
+            pnl_pct = (mark_p - entry) / entry * 100
+            daily_decay_pct = theta / mark_p * 100 if mark_p > 0 else 0
+
+            # 冷却: 每个对冲仓位 6 小时提醒一次
+            cd_key = f"hedge_exit:{sym}"
+            last = self.last_expiry_warn.get(cd_key, 0)
+            if now - last < 21600:
+                continue
+
+            reason = ""
+            action = ""
+
+            # 安全检查: 强平距离 < 35% 时不建议平对冲
+            if drop_with < 35:
+                continue
+
+            # 条件 1: 被保护的 Short Put 已平仓 (最根本的退出理由)
+            # 检查: 对冲的 K 附近是否还有 Short Put
+            if not any(abs(k - strike) < 10000 for k in short_strikes):
+                reason = "被保护的 Short Put 已不存在"
+                action = "对冲对象已平仓, 建议平掉"
+
+            # 条件 2: 盈利 > 80%
+            elif pnl_pct > 80:
+                reason = f"盈利 {pnl_pct:.0f}%, 已充分获利"
+                action = "建议止盈平仓, 锁定对冲利润"
+
+            # 条件 3: 风险解除 (含对冲 >45%, 去掉对冲 >35%)
+            elif drop_with > 45 and drop_without > 35:
+                reason = (f"强平距离已恢复 (含对冲{drop_with:.0f}%, "
+                         f"去掉也有{drop_without:.0f}%)")
+                action = "风险已解除, 可考虑平掉释放资金"
+
+            # 条件 4: Theta 损耗过快 (日损耗 > 8%, DTE < 14)
+            elif daily_decay_pct > 8 and dte < 14:
+                days_left = mark_p / theta if theta > 0 else 999
+                reason = (f"日损耗 ${theta:.0f} = 价值的 {daily_decay_pct:.0f}%/天, "
+                         f"~{days_left:.0f}天耗尽")
+                action = "Theta 加速衰减, 建议平仓或续期"
+
+            # 条件 5: 价值归零
+            elif mark_p < 50 and dte < 10:
+                reason = f"剩余价值仅 ${mark_p:.0f}, DTE {dte:.0f}天"
+                action = "几乎无保护作用, 建议卖掉残值"
+
+            if reason:
+                self.last_expiry_warn[cd_key] = now
+                alerts.append({
+                    "symbol": sym,
+                    "short_sym": short_sym,
+                    "reason": reason,
+                    "action": action,
+                    "pnl_pct": round(pnl_pct, 1),
+                    "mark": mark_p,
+                    "entry": entry,
+                    "dte": dte,
+                    "msg": (
+                        f"💰 <b>对冲止盈提醒</b>\n\n"
+                        f"Long {short_sym}\n"
+                        f"入场 ${entry:.0f} → 当前 ${mark_p:.0f} "
+                        f"({pnl_pct:+.0f}%) | DTE {dte:.0f}天\n\n"
+                        f"📌 {reason}\n"
+                        f"👉 {action}"
+                    ),
+                })
+
+        return alerts
+
     def check_hedge_expiry(self, pos_list: list) -> list[dict]:
         """检查对冲仓位是否即将到期, 需要续期"""
         alerts = []
