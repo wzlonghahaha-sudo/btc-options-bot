@@ -416,10 +416,46 @@ class RuleBasedAnalyst:
                 theta = p.get("theta", 0)
                 mark = p.get("mark", 0)
                 alert = p.get("alert", "OK")
-                abs_qty = abs(p.get("qty", 0))
+                qty = p.get("qty", 0)
+                abs_qty = abs(qty)
+                direction = p.get("direction", "Short")
                 total_pnl += pnl
 
                 short_sym = sym.split("BTC-")[-1] if "BTC-" in sym else sym
+
+                # === Long Put: 对冲仓位，用专属逻辑评价 ===
+                if direction == "Long" or qty > 0:
+                    theta_cost = abs(theta) * abs_qty if theta < 0 else 0
+                    lines.append(f"• 📌 <b>{short_sym} (Long Put 对冲)</b>")
+                    status_parts = []
+                    if pnl_pct > 20:
+                        status_parts.append(f"盈利 {pnl_pct:.0f}%")
+                    elif pnl_pct > 0:
+                        status_parts.append(f"小幅盈利 {pnl_pct:.0f}%")
+                    elif pnl_pct > -50:
+                        status_parts.append(f"浮亏 {pnl_pct:.0f}%（对冲成本）")
+                    else:
+                        status_parts.append(f"浮亏 {pnl_pct:.0f}%")
+
+                    status_parts.append(f"DTE {dte:.0f}天")
+                    if theta_cost > 0:
+                        status_parts.append(f"Theta损耗 ${theta_cost:.1f}/天")
+
+                    # Long Put 评价逻辑
+                    if dte < 3:
+                        lines.append(f"  ⚠️ 即将到期! {'，'.join(status_parts)}")
+                        lines.append(f"  如仍需对冲，考虑续期到下一个到期日")
+                        position_actions.append(("LONG_EXPIRING", short_sym, "即将到期", None))
+                    elif dte < 7 and pnl_pct < -30:
+                        lines.append(f"  {'，'.join(status_parts)}")
+                        lines.append(f"  到期临近+亏损较大，对冲价值在衰减")
+                        position_actions.append(("HOLD", short_sym, "", None))
+                    else:
+                        lines.append(f"  {'，'.join(status_parts)}，对冲保护生效中")
+                        position_actions.append(("HOLD", short_sym, "", None))
+                    continue
+
+                # === 以下仅 Short Put 逻辑 ===
 
                 # 解析旧仓到期月
                 old_parts = sym.split("-")
@@ -433,7 +469,7 @@ class RuleBasedAnalyst:
                 # theta 年化效率: %/天 × 365
                 theta_annual = old_theta_on_margin * 365
 
-                # === 平仓条件检查 ===
+                # === 平仓条件检查 (仅 Short Put) ===
                 # 核心原则: theta 还在高效赚钱的仓位不轻易平掉
                 # 阈值: theta/保证金 > 0.05%/天 (~18%年化) 视为"仍有效率"
                 THETA_EFF_FLOOR = 0.05  # %/天
