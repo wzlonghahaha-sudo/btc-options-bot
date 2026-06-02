@@ -1223,7 +1223,7 @@ class MonitorService:
             else:
                 caption = "📊 <b>IV Dashboard</b>"
 
-            self.tg.broadcast_photo(chart_path, caption=caption, silent=True)
+            self.tg.broadcast_photo(chart_path, caption=caption)
             log.info("推送 IV 图表")
 
             # 如果 AI 报告太长没放进 caption, 单独发
