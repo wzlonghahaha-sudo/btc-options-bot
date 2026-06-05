@@ -294,21 +294,23 @@ class TradeJournal:
                 break
 
     # --- 挂单成交检测 ---
-    def check_order_fills(self, current_orders: list, history_checker=None) -> list[dict]:
+    def check_order_fills(self, current_orders: list, api=None) -> list[dict]:
         """
         检测挂单状态变化 (成交/取消)
 
+        通过 API 查询消失挂单的真实状态, 避免误报。
+
         Args:
             current_orders: 当前挂单列表 (来自 API)
-            history_checker: 可选的回调函数，用于查询历史订单
+            api: BinanceOptionsAPI 实例 (用于查询订单真实状态)
 
-        Returns: 填充事件列表 [{type: FILLED/CANCELLED, ...}]
+        Returns: 事件列表 [{type: FILLED/CANCELLED/EXPIRED, ...}]
         """
         events = []
         known = self.data.get("known_orders", {})
         now = time.time()
 
-        # 当前挂单集合
+        # 当前挂单集合 (更新状态)
         current_order_ids = set()
         for o in current_orders:
             oid = str(o.get("orderId", ""))
@@ -317,7 +319,7 @@ class TradeJournal:
             current_order_ids.add(oid)
 
             if oid not in known:
-                # 新挂单
+                # 新挂单: 记录但不推送
                 known[oid] = {
                     "symbol": o.get("symbol", ""),
                     "side": o.get("side", ""),
@@ -326,29 +328,58 @@ class TradeJournal:
                     "status": o.get("status", ""),
                     "first_seen": now,
                 }
+            else:
+                # 已知挂单: 更新状态
+                known[oid]["status"] = o.get("status", known[oid].get("status", ""))
 
-        # 检测消失的挂单 (成交或取消)
-        disappeared = [oid for oid in known if oid not in current_order_ids]
+        # 检测消失的挂单
+        disappeared = [oid for oid in list(known.keys()) if oid not in current_order_ids]
         for oid in disappeared:
             info = known[oid]
-            # 判断是成交还是取消
-            # 默认认为是成交 (保守处理)，除非能通过 history_checker 确认
-            event_type = "FILLED"
-            if info.get("status") == "CANCELLED":
-                event_type = "CANCELLED"
+            sym = info.get("symbol", "")
+
+            # 通过 API 查询订单真实状态
+            real_status = ""
+            if api and sym:
+                try:
+                    order_detail = api.get_order(sym, order_id=int(oid))
+                    real_status = order_detail.get("status", "")
+                except Exception as e:
+                    log.warning(f"查询订单 {oid} 状态失败: {e}")
+
+            # 根据真实状态判断
+            if real_status == "FILLED":
+                event_type = "FILLED"
+            elif real_status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                event_type = real_status
+            elif real_status == "PARTIALLY_FILLED":
+                # 部分成交: 记录但等待完全成交
+                info["status"] = real_status
+                continue
+            elif real_status == "":
+                # 查询失败: 不推送, 等下次再查
+                log.warning(f"无法确认订单 {oid} ({sym}) 状态, 跳过")
+                continue
+            else:
+                # 未知状态: 不推送
+                log.warning(f"订单 {oid} 未知状态: {real_status}")
+                del known[oid]
+                continue
 
             events.append({
                 "type": event_type,
                 "order_id": oid,
-                "symbol": info["symbol"],
+                "symbol": sym,
                 "side": info["side"],
                 "price": info["price"],
                 "qty": info["qty"],
             })
 
             if event_type == "FILLED":
-                log.info(f"挂单成交: {info['symbol']} {info['side']} "
+                log.info(f"挂单成交: {sym} {info['side']} "
                          f"{info['qty']}张 @ ${info['price']:,.0f}")
+            else:
+                log.info(f"挂单{event_type}: {sym}")
             del known[oid]
 
         self.data["known_orders"] = known

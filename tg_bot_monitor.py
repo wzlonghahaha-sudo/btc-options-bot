@@ -1052,7 +1052,7 @@ class MonitorService:
         # P2-10: 挂单成交检测
         try:
             current_orders = self.api.get_open_orders()
-            order_events = self.journal.check_order_fills(current_orders)
+            order_events = self.journal.check_order_fills(current_orders, api=self.api)
             for ev in order_events:
                 if ev["type"] == "FILLED":
                     side_cn = "卖出" if ev["side"] == "SELL" else "买入"
