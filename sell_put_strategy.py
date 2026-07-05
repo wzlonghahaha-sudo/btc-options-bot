@@ -225,6 +225,28 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
     # 6. Gamma 风险: gamma / delta, gamma 越大相对 delta 越危险
     gamma_risk = abs(gamma) / abs_delta * spot if abs_delta > 0 else 0
 
+    # 7. 期望值指标
+    # p_itm: 到期时变为 ITM 的概率, 用 |delta| 近似
+    #   取舍说明: BS delta 近似 P(ITM) 是业界常用简化, 严格来说应用 N(-d2)
+    #   但对于筛选用途, |delta| 足够且获取成本为零 (API 直接返回),
+    #   而 N(-d2) 需要自行计算 d2, 额外引入 IV/r/T 误差。
+    p_itm = abs_delta
+
+    # expected_value: 卖 Put 的期望收益 (粗估)
+    #   假设: 如果到期 ITM, BTC 均值跌到行权价下方一定深度
+    #   条件损失 = max(strike - spot * 0.85, strike * 0.10)
+    #   这是保守假设: ITM 时 BTC 平均跌到 spot 的 85% 或行权价 10% 以内
+    #   EV = bid - p_itm × 条件损失
+    conditional_loss = max(strike - spot * 0.85, strike * 0.10)
+    expected_value = bid - p_itm * conditional_loss
+
+    # odds_ratio: 每承担一单位 delta 加权名义风险收多少权利金
+    odds_ratio = bid / (abs_delta * strike) if abs_delta > 0 and strike > 0 else 0
+
+    # EV ≤ 0 的合约直接过滤
+    if expected_value <= 0:
+        return None
+
     # --- 评分 ---
 
     # Theta 效率评分 (0-100): 日衰减 > 3% 满分
@@ -313,6 +335,10 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
         "gamma_penalty": round(gamma_penalty, 1),
         "event_penalty": event_penalty,
         "event_descs": event_descs,
+        # 期望值指标
+        "p_itm": round(p_itm, 4),
+        "expected_value": round(expected_value, 2),
+        "odds_ratio": round(odds_ratio, 6),
         "total_score": round(total_score, 2),
     }
 
@@ -418,16 +444,22 @@ def print_results(results: list[dict], top_n: int = 15):
         print(f"    日衰减效率:     {r['theta_daily_pct']:.2f}%/天")
         print(f"    IV溢价:         {r['iv_premium']:+.1f}%  (相对同期限中位数)")
         print(f"    年化收益率:     {r['annualized_return']:.1f}%  (基于预估保证金)")
+        print(f"    期望值(EV):     ${r['expected_value']:+.2f}  (P(ITM)={r['p_itm']:.2%})")
+        print(f"    赔率:           {r['odds_ratio']:.4%}  (bid / delta加权名义风险)")
+        # 事件提醒
+        if r.get("event_descs"):
+            for ed in r["event_descs"]:
+                print(f"    {ed}")
         print(f"  评分明细: Theta={r['theta_score']:.0f} | IV={r['iv_score']:.0f} | "
               f"安全={r['safety_score']:.0f} | 流动={r['liquidity_score']:.0f} | "
               f"DTE={r['dte_score']:.0f} | Delta加分={r['delta_bonus']} | "
-              f"Gamma罚分={r['gamma_penalty']:.0f}")
+              f"Gamma罚分={r['gamma_penalty']:.0f} | 事件={r.get('event_penalty', 0)}")
 
     # 汇总表
     print(f"\n\n{'='*90}")
     print("  汇总表")
     print(f"{'='*90}")
-    header = f"{'#':>3} {'合约':<28} {'评分':>5} {'行权价':>8} {'到期天':>5} {'Delta':>7} {'Bid':>8} {'安全垫%':>7} {'年化%':>7} {'IV':>6} {'日衰%':>6}"
+    header = f"{'#':>3} {'合约':<28} {'评分':>5} {'行权价':>8} {'到期天':>5} {'Delta':>7} {'Bid':>8} {'安全垫%':>7} {'EV$':>7} {'赔率':>7} {'年化%':>7}"
     print(header)
     print("-" * len(header))
 
@@ -435,7 +467,8 @@ def print_results(results: list[dict], top_n: int = 15):
         print(f"{i:>3} {r['symbol']:<28} {r['total_score']:>5.1f} "
               f"${r['strike']:>7,.0f} {r['dte']:>5.1f} {r['delta']:>7.4f} "
               f"${r['bid']:>7,.1f} {r['safety_cushion']:>6.1f}% "
-              f"{r['annualized_return']:>6.1f}% {r['mark_iv']:>5.3f} {r['theta_daily_pct']:>5.2f}%")
+              f"${r['expected_value']:>6.1f} {r['odds_ratio']:>6.4f} "
+              f"{r['annualized_return']:>6.1f}%")
 
     # 风险提醒
     print(f"\n\n{'='*90}")
