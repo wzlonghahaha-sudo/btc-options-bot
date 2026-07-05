@@ -1314,7 +1314,7 @@ class MonitorService:
     # --- TG 命令处理 ---
     def handle_commands(self):
         """处理 TG 用户命令"""
-        updates = self.tg.get_updates(offset=self.update_offset, timeout=0)
+        updates = self.tg.get_updates(offset=self.update_offset, timeout=25)
 
         for update in updates:
             self.update_offset = update["update_id"] + 1
@@ -1762,14 +1762,15 @@ class MonitorService:
 
     # --- 命令监听线程 ---
     def _command_loop(self):
-        """独立线程: 每秒轮询 TG 消息, 秒回命令"""
-        log.info("命令监听线程启动")
+        """独立线程: long polling TG 消息 (timeout=25s), 秒回命令"""
+        log.info("命令监听线程启动 (long polling, timeout=25s)")
         while self.running:
             try:
                 self.handle_commands()
             except Exception as e:
                 log.error(f"命令处理异常: {e}")
-            time.sleep(1)  # 每秒检查一次, 保证秒回
+            # long poll 本身会阻塞最多 25s (有消息时立即返回)
+            # 每次返回后检查 self.running, 退出响应 ≤25s (通常更快)
 
     def _ping_heartbeat(self):
         """外部心跳 ping (Dead Man's Switch)"""
