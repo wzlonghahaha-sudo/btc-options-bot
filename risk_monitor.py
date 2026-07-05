@@ -208,8 +208,13 @@ class RiskEngine:
         # 5. 仓位集中度检查 (跨持仓)
         alerts.extend(self._check_concentration(positions, spot))
 
-        # 6. 组合级强平价格和压力测试 (需要 account_balance)
+        # 6. 账户级保证金使用率检查 (替代旧的单仓 margin_usage 指标)
         account_balance = data.get("account_balance", 0)
+        if account_balance > 0 and positions:
+            alerts.extend(self._check_account_margin_usage(
+                positions, marks, spot, account_balance))
+
+        # 7. 组合级强平价格和压力测试 (需要 account_balance)
         if account_balance > 0 and positions:
             alerts.extend(self._check_liquidation(positions, marks, spot, account_balance))
 
@@ -325,6 +330,61 @@ class RiskEngine:
                 "iv": iv if iv > 0 else 0.40,
             })
         return result
+
+    def _check_account_margin_usage(self, positions: list, marks: dict,
+                                   spot: float, account_balance: float) -> list[RiskAlert]:
+        """
+        账户级保证金使用率检查 (替代旧的单仓 margin_usage)
+
+        真实使用率 = 组合维持保证金合计 / 账户净值
+        账户净值 = account_balance + 未实现盈亏 (balance 参数已含此)
+        维持保证金用 calc_maint_margin (校准到币安精确值)
+
+        阈值沿用原 60%/80%/95%。
+        """
+        cfg = RiskConfig()
+        alerts = []
+
+        total_maint = 0.0
+        for pos in positions:
+            qty = float(pos.get("quantity", 0))
+            if qty >= 0:
+                continue  # Long Put 不需要保证金
+            sym = pos["symbol"]
+            abs_qty = abs(qty)
+            strike = float(pos.get("strikePrice", 0))
+            mark_price = float(marks.get(sym, {}).get("markPrice",
+                               pos.get("markPrice", 0)))
+            total_maint += calc_maint_margin(spot, strike, abs_qty, mark_price)
+
+        if total_maint <= 0 or account_balance <= 0:
+            return alerts
+
+        usage = total_maint / account_balance
+
+        if usage > cfg.MARGIN_USAGE_CRITICAL:
+            alerts.append(RiskAlert(
+                level="CRITICAL", category="MARGIN", symbol="PORTFOLIO",
+                title=f"账户保证金使用率 {usage:.0%}!",
+                detail=f"维持保证金合计 ${total_maint:,.0f} vs 账户净值 ${account_balance:,.0f}",
+                action="立即追加保证金或减仓!",
+            ))
+        elif usage > cfg.MARGIN_USAGE_DANGER:
+            alerts.append(RiskAlert(
+                level="DANGER", category="MARGIN", symbol="PORTFOLIO",
+                title=f"账户保证金使用率 {usage:.0%}",
+                detail=f"维持保证金合计 ${total_maint:,.0f} vs 账户净值 ${account_balance:,.0f}",
+                action="准备追加保证金或减仓",
+            ))
+        elif usage > cfg.MARGIN_USAGE_WARN:
+            alerts.append(RiskAlert(
+                level="WARNING", category="MARGIN", symbol="PORTFOLIO",
+                title=f"账户保证金使用率 {usage:.0%}",
+                detail=f"维持保证金合计 ${total_maint:,.0f} vs 账户净值 ${account_balance:,.0f}",
+                action="关注保证金使用情况",
+            ))
+
+        return alerts
 
     def _check_liquidation(self, positions: list, marks: dict,
                            spot: float, account_balance: float) -> list[RiskAlert]:
@@ -597,34 +657,10 @@ class RiskEngine:
                 detail=f"行权价 ${strike:,.0f}",
             ))
 
-        # === 3. 保证金 / 爆仓估算 (统一公式, 含 mark_price) ===
-        margin_est = calc_put_margin(spot, strike, abs_qty, mark_price)
-
-        # 保证金使用率 ≈ 当前持仓市值 / 保证金
-        margin_usage = mark_price * abs_qty / margin_est if margin_est > 0 else 0
-
-        if margin_usage > cfg.MARGIN_USAGE_CRITICAL:
-            alerts.append(RiskAlert(
-                level="CRITICAL", category="MARGIN", symbol=sym,
-                title=f"保证金使用率 {margin_usage:.0%}!",
-                detail=f"持仓市值 ${mark_price * abs_qty:,.0f} vs 预估保证金 ${margin_est:,.0f}\n"
-                       f"极度接近爆仓线!",
-                action="立即追加保证金或平仓!",
-            ))
-        elif margin_usage > cfg.MARGIN_USAGE_DANGER:
-            alerts.append(RiskAlert(
-                level="DANGER", category="MARGIN", symbol=sym,
-                title=f"保证金使用率 {margin_usage:.0%}",
-                detail=f"持仓市值 ${mark_price * abs_qty:,.0f} vs 保证金 ${margin_est:,.0f}",
-                action="准备追加保证金或减仓",
-            ))
-        elif margin_usage > cfg.MARGIN_USAGE_WARN:
-            alerts.append(RiskAlert(
-                level="WARNING", category="MARGIN", symbol=sym,
-                title=f"保证金使用率 {margin_usage:.0%}",
-                detail=f"保证金开始吃紧",
-                action="关注保证金情况",
-            ))
+        # === 3. 保证金 (单仓级已删除, 改为 check_all 中的账户级使用率检查) ===
+        # 旧指标 mark_price × qty / initial_margin 不是真正的保证金使用率,
+        # far OTM 时永远极小, 60/80/95% 阈值几乎不触发, 产生虚假安全感。
+        # 账户级使用率: 组合维持保证金合计 / 账户净值, 见 check_all()
 
         # === 4. 希腊值风险 ===
         abs_delta = abs(delta) * abs_qty
