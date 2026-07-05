@@ -142,7 +142,8 @@ def fetch_all_data(api: BinanceOptionsAPI) -> dict:
 #  分析每个 Put 合约
 # ============================================================
 def analyze_put(symbol: str, data: dict, iv_stats: dict,
-                vol_analysis: dict = None) -> dict | None:
+                vol_analysis: dict = None,
+                iv_rank_data: dict = None) -> dict | None:
     """分析单个 Put 合约, 返回分析结果或 None (不满足条件)"""
 
     cfg = Config()
@@ -253,8 +254,20 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict,
     # Theta 效率评分 (0-100): 日衰减 > 3% 满分
     theta_score = min(theta_daily_pct / 3.0 * 100, 100)
 
-    # IV 溢价评分 (0-100): IV 比中位数高 20% 满分, 低于中位数扣分
-    iv_score = min(max((iv_premium + 10) / 30 * 100, 0), 100)
+    # IV 溢价评分: 混合时序 IV Rank (70%) + 横截面溢价 (30%)
+    # 横截面: 原逻辑保留 (IV 比中位数高 20% 满分, 低于中位数扣分)
+    cross_section_score = min(max((iv_premium + 10) / 30 * 100, 0), 100)
+
+    if iv_rank_data:
+        from iv_rank import blend_iv_scores
+        iv_score = blend_iv_scores(
+            iv_rank_data["score"],
+            cross_section_score,
+            iv_rank_data["sufficient"],
+        )
+    else:
+        # iv_rank 不可用, 纯用横截面
+        iv_score = cross_section_score
 
     # 安全垫评分 (0-100): 安全垫 > 15% 满分
     safety_score = min(max(safety_cushion / 15 * 100, 0), 100)
@@ -357,6 +370,10 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict,
         "gamma_penalty": round(gamma_penalty, 1),
         "event_penalty": event_penalty,
         "event_descs": event_descs,
+        # IV Rank
+        "iv_rank": round(iv_rank_data["rank"], 1) if iv_rank_data else None,
+        "iv_rank_note": iv_rank_data.get("note", "") if iv_rank_data else "N/A",
+        "cross_section_score": round(cross_section_score, 1),
         # IV/HV 比率
         "iv_hv_ratio": round(iv_hv_ratio, 2),
         "iv_hv_edge": iv_hv_edge,
@@ -428,11 +445,38 @@ def run_strategy(api: BinanceOptionsAPI = None) -> list[dict]:
     except Exception as e:
         print(f"  [!] IV/HV 分析获取失败: {e}")
 
+    # 获取时序 IV Rank (用 iv_surface_history)
+    iv_rank_data = None
+    try:
+        from state_persistence import StatePersistence
+        from iv_rank import calc_iv_rank, calc_iv_rank_score
+        sp = StatePersistence()
+        iv_history = sp.get_iv_surface_history(hours=168)  # 7 天
+        # 当前全局 median IV
+        current_global_iv = global_iv
+        rank_value, rank_note = calc_iv_rank(current_global_iv, iv_history)
+        rank_score = calc_iv_rank_score(rank_value)
+        has_sufficient = rank_note == ""
+        iv_rank_data = {
+            "rank": rank_value,
+            "score": rank_score,
+            "note": rank_note,
+            "sufficient": has_sufficient,
+        }
+        if rank_note:
+            print(f"  [!] IV Rank: {rank_note} (使用中性值 {rank_value})")
+        else:
+            print(f"  IV Rank: {rank_value:.0f}/100 (评分 {rank_score:.0f})")
+    except Exception as e:
+        print(f"  [!] IV Rank 获取失败: {e}")
+
     print(f"\n开始分析 {len(data['btc_puts'])} 个 BTC Put 合约...")
 
     results = []
     for symbol in data["btc_puts"]:
-        analysis = analyze_put(symbol, data, iv_stats, vol_analysis=vol_analysis)
+        analysis = analyze_put(symbol, data, iv_stats,
+                               vol_analysis=vol_analysis,
+                               iv_rank_data=iv_rank_data)
         if analysis:
             results.append(analysis)
 
@@ -482,7 +526,10 @@ def print_results(results: list[dict], top_n: int = 15):
         print(f"    虚值程度(OTM):  {r['otm_pct']:.1f}%  (当前价比行权价高 {r['otm_pct']:.1f}%)")
         print(f"    安全垫:         {r['safety_cushion']:.1f}%  (BTC跌到 ${r['breakeven']:,.0f} 才亏)")
         print(f"    日衰减效率:     {r['theta_daily_pct']:.2f}%/天")
-        print(f"    IV溢价:         {r['iv_premium']:+.1f}%  (相对同期限中位数)")
+        iv_rank_str = f"{r['iv_rank']:.0f}" if r.get('iv_rank') is not None else "N/A"
+        rank_note = f" ({r['iv_rank_note']})" if r.get('iv_rank_note') else ""
+        print(f"    IV Rank:        {iv_rank_str}/100{rank_note}")
+        print(f"    IV溢价(横截面): {r['iv_premium']:+.1f}%  (相对同期限中位数)")
         print(f"    年化收益率:     {r['annualized_return']:.1f}%  (基于预估保证金)")
         print(f"    IV/HV:          {r['iv_hv_ratio']:.2f}  (edge={r['iv_hv_edge']})")
         print(f"    期望值(EV):     ${r['expected_value']:+.2f}  (P(ITM)={r['p_itm']:.2%})")
