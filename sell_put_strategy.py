@@ -141,7 +141,8 @@ def fetch_all_data(api: BinanceOptionsAPI) -> dict:
 # ============================================================
 #  分析每个 Put 合约
 # ============================================================
-def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
+def analyze_put(symbol: str, data: dict, iv_stats: dict,
+                vol_analysis: dict = None) -> dict | None:
     """分析单个 Put 合约, 返回分析结果或 None (不满足条件)"""
 
     cfg = Config()
@@ -289,6 +290,25 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
     except Exception:
         event_penalty, event_descs = 0, []
 
+    # IV/HV 比率调整 (卖方核心 alpha)
+    # vol_analysis 来自 VolatilityAnalyzer.get_full_analysis(), 全局缓存
+    iv_hv_ratio = 0
+    iv_hv_edge = "N/A"
+    iv_hv_bonus = 0
+    iv_hv_penalty = 1.0  # 乘法系数
+
+    if vol_analysis and vol_analysis.get("iv_hv_ratio"):
+        iv_hv_ratio = vol_analysis["iv_hv_ratio"]
+        iv_hv_edge = vol_analysis.get("edge", "N/A")
+        if iv_hv_ratio < 1.0:
+            # IV < HV: 卖方无 edge, 惩罚 ×0.5
+            iv_hv_penalty = 0.5
+            iv_hv_edge = "NONE"
+        elif iv_hv_ratio >= 1.5:
+            iv_hv_bonus = 10
+        elif iv_hv_ratio >= 1.25:
+            iv_hv_bonus = 5
+
     # 综合评分
     total_score = (
         cfg.W_THETA_EFF * theta_score / 100
@@ -299,7 +319,9 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
         + delta_bonus
         - gamma_penalty
         + event_penalty
+        + iv_hv_bonus
     )
+    total_score *= iv_hv_penalty  # IV < HV 时总分减半
 
     return {
         "symbol": symbol,
@@ -335,6 +357,10 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
         "gamma_penalty": round(gamma_penalty, 1),
         "event_penalty": event_penalty,
         "event_descs": event_descs,
+        # IV/HV 比率
+        "iv_hv_ratio": round(iv_hv_ratio, 2),
+        "iv_hv_edge": iv_hv_edge,
+        "iv_hv_bonus": iv_hv_bonus,
         # 期望值指标
         "p_itm": round(p_itm, 4),
         "expected_value": round(expected_value, 2),
@@ -388,11 +414,25 @@ def run_strategy(api: BinanceOptionsAPI = None) -> list[dict]:
     data = fetch_all_data(api)
     iv_stats = calc_iv_stats(data)
 
+    # 获取 IV/HV 分析 (缓存, 只调一次, 不要每个合约调一次)
+    vol_analysis = None
+    try:
+        from profit_optimizer import VolatilityAnalyzer
+        va = VolatilityAnalyzer()
+        # 取全局 ATM IV 近似值 (用中位数)
+        global_iv = 0.40
+        for exp_key, stats in iv_stats.items():
+            global_iv = stats.get("median_iv", 0.40)
+            break  # 取第一个到期日的中位数作为近似
+        vol_analysis = va.get_full_analysis(global_iv)
+    except Exception as e:
+        print(f"  [!] IV/HV 分析获取失败: {e}")
+
     print(f"\n开始分析 {len(data['btc_puts'])} 个 BTC Put 合约...")
 
     results = []
     for symbol in data["btc_puts"]:
-        analysis = analyze_put(symbol, data, iv_stats)
+        analysis = analyze_put(symbol, data, iv_stats, vol_analysis=vol_analysis)
         if analysis:
             results.append(analysis)
 
@@ -444,6 +484,7 @@ def print_results(results: list[dict], top_n: int = 15):
         print(f"    日衰减效率:     {r['theta_daily_pct']:.2f}%/天")
         print(f"    IV溢价:         {r['iv_premium']:+.1f}%  (相对同期限中位数)")
         print(f"    年化收益率:     {r['annualized_return']:.1f}%  (基于预估保证金)")
+        print(f"    IV/HV:          {r['iv_hv_ratio']:.2f}  (edge={r['iv_hv_edge']})")
         print(f"    期望值(EV):     ${r['expected_value']:+.2f}  (P(ITM)={r['p_itm']:.2%})")
         print(f"    赔率:           {r['odds_ratio']:.4%}  (bid / delta加权名义风险)")
         # 事件提醒

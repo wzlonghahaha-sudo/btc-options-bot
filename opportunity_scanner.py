@@ -428,6 +428,20 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         if spread_pct > 8:
             score = score * 0.92
 
+        # IV/HV 惩罚: IV < HV 时卖方无 edge, 总分 ×0.5
+        iv_hv_edge_str = "N/A"
+        if iv_hv_ratio < 1.0:
+            score *= 0.5
+            iv_hv_edge_str = "NONE"
+        elif iv_hv_ratio >= 1.5:
+            score += 10
+            iv_hv_edge_str = "STRONG"
+        elif iv_hv_ratio >= 1.25:
+            score += 5
+            iv_hv_edge_str = "MODERATE"
+        elif iv_hv_ratio >= 1.0:
+            iv_hv_edge_str = "SLIGHT"
+
         # 事件日历扣减: 存续期内每个 HIGH 事件 -8 分
         event_descs = []
         try:
