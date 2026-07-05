@@ -428,6 +428,17 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
         if spread_pct > 8:
             score = score * 0.92
 
+        # 事件日历扣减: 存续期内每个 HIGH 事件 -8 分
+        event_descs = []
+        try:
+            from event_calendar import score_penalty_for_events
+            from datetime import date as _date
+            ev_penalty, event_descs = score_penalty_for_events(
+                _date.today(), expiry_date.date() if hasattr(expiry_date, 'date') else expiry_date)
+            score += ev_penalty
+        except Exception:
+            pass
+
         # === 账户风控评估 ===
         new_portfolio_delta = account.portfolio_delta + abs_delta
         new_margin = account.used_margin + margin_1
@@ -652,7 +663,18 @@ def format_signal_push(opps: list, account: AccountRisk) -> str:
     - <78分: 不推送 (用户通过 /top 命令自行查看)
     """
     cfg = ScanConfig()
-    top_opps = [o for o in opps if o.score >= cfg.SCORE_PUSH and o.can_open]
+
+    # 事件前 48 小时内, 临时提高推送门槛 +10 (避免在高波动前开仓)
+    push_threshold = cfg.SCORE_PUSH
+    try:
+        from event_calendar import is_pre_event_window
+        in_window, evt = is_pre_event_window(48)
+        if in_window and evt:
+            push_threshold += 10
+    except Exception:
+        pass
+
+    top_opps = [o for o in opps if o.score >= push_threshold and o.can_open]
 
     if not top_opps:
         return ""

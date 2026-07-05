@@ -258,6 +258,15 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
     # Gamma 惩罚: gamma risk 越大越危险
     gamma_penalty = min(gamma_risk / 0.5 * 10, 15)
 
+    # 事件日历扣减 (存续期内每个 HIGH 事件 -8 分)
+    try:
+        from event_calendar import score_penalty_for_events
+        from datetime import date as _date
+        event_penalty, event_descs = score_penalty_for_events(
+            _date.today(), expiry.date())
+    except Exception:
+        event_penalty, event_descs = 0, []
+
     # 综合评分
     total_score = (
         cfg.W_THETA_EFF * theta_score / 100
@@ -267,6 +276,7 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
         + cfg.W_DTE * dte_score / 100
         + delta_bonus
         - gamma_penalty
+        + event_penalty
     )
 
     return {
@@ -301,6 +311,8 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict) -> dict | None:
         "dte_score": round(dte_score, 1),
         "delta_bonus": delta_bonus,
         "gamma_penalty": round(gamma_penalty, 1),
+        "event_penalty": event_penalty,
+        "event_descs": event_descs,
         "total_score": round(total_score, 2),
     }
 
