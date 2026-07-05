@@ -101,18 +101,12 @@ def assess_account_risk(api, data: dict) -> AccountRisk:
     except Exception:
         positions = []
 
-    # 估算总资金 (通过资金流水)
-    try:
-        bills = api.get_bill(limit=200)
-        transfers = [b for b in bills if b.get("type") == "TRANSFER"]
-        total_in = sum(float(b["amount"]) for b in transfers if float(b["amount"]) > 0)
-        total_out = sum(abs(float(b["amount"])) for b in transfers if float(b["amount"]) < 0)
-        contracts = [b for b in bills if b.get("type") == "CONTRACT"]
-        realized_pnl = sum(float(b["amount"]) for b in contracts)
-        fees = sum(float(b["amount"]) for b in bills if b.get("type") == "FEE")
-        total_balance = total_in - total_out + realized_pnl + fees
-    except Exception:
-        total_balance = spot * cfg.MARGIN_RATE * 5  # 粗略估算
+    # 获取账户权益 (优先 API 直读, fallback 流水法)
+    from binance_options import get_account_equity
+    acct = get_account_equity(api)
+    total_balance = acct["equity"] if acct["equity"] > 0 else acct["margin_balance"]
+    if total_balance <= 0:
+        total_balance = spot * cfg.MARGIN_RATE * 5  # 最终兜底
 
     ar = AccountRisk(total_balance=max(total_balance, 1))
     ar.positions = []

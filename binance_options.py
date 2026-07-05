@@ -299,6 +299,71 @@ class BinanceOptionsAPI:
 # ========================
 # 辅助函数
 # ========================
+
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
+
+def get_account_equity(api: "BinanceOptionsAPI") -> dict:
+    """
+    统一的账户权益获取函数 (单一事实来源)
+
+    优先使用 /eapi/v1/marginAccount API 直读 (精确),
+    fallback 用 get_bill() 流水累加 (不可靠, 超 200 条会截断)。
+
+    Returns:
+        {
+            "equity": float,            # 账户权益 (含浮盈亏)
+            "margin_balance": float,    # 保证金余额 (现金)
+            "available": float,         # 可用保证金
+            "unrealized_pnl": float,    # 未实现盈亏
+            "initial_margin": float,    # 已用初始保证金
+            "maint_margin": float,      # 维持保证金
+            "source": str,              # "api" 或 "bill_fallback"
+        }
+    """
+    # 优先: /eapi/v1/marginAccount (经验证可用且精确)
+    try:
+        raw = api._get("/eapi/v1/marginAccount", signed=True)
+        asset_list = raw.get("asset", [])
+        if isinstance(asset_list, list) and asset_list:
+            a = asset_list[0]
+            return {
+                "equity": float(a.get("equity", 0)),
+                "margin_balance": float(a.get("marginBalance", 0)),
+                "available": float(a.get("available", 0)),
+                "unrealized_pnl": float(a.get("unrealizedPNL", 0)),
+                "initial_margin": float(a.get("initialMargin", 0)),
+                "maint_margin": float(a.get("maintMargin", 0)),
+                "source": "api",
+            }
+    except Exception as e:
+        _log.warning(f"marginAccount API 失败, 降级到流水法: {e}")
+
+    # Fallback: get_bill() 流水累加 (不可靠, 仅在 API 不可用时使用)
+    _log.warning("使用 get_bill() 流水法估算余额 — 结果可能不准确(流水超200条会截断)")
+    try:
+        bills = api.get_bill(currency="USDT", limit=1000)
+        total = sum(float(b.get("amount", 0)) for b in bills)
+        return {
+            "equity": total,
+            "margin_balance": total,
+            "available": total * 0.5,       # 粗略估算
+            "unrealized_pnl": 0,
+            "initial_margin": 0,
+            "maint_margin": 0,
+            "source": "bill_fallback",
+        }
+    except Exception as e2:
+        _log.error(f"get_bill() 也失败了: {e2}")
+        return {
+            "equity": 0, "margin_balance": 0, "available": 0,
+            "unrealized_pnl": 0, "initial_margin": 0, "maint_margin": 0,
+            "source": "error",
+        }
+
+
 def ts_to_str(ts_ms: int) -> str:
     """毫秒时间戳转可读时间"""
     return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
