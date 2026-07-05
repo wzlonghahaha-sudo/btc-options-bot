@@ -155,6 +155,60 @@ class StressResult:
     positions: list            # 各持仓明细
 
 
+def _calc_stressed_iv(iv: float, drop_pct: float, iv_shock: float = 0.10) -> float:
+    """
+    计算压力场景下的 IV (双模式取大)
+
+    BTC 大跌时 IV 会急剧飙升(2020-03-12、2021-05-19 级别行情中
+    BTC -30% 时 IV 接近翻倍), 纯线性加点会严重低估尾部风险。
+
+    双模式:
+      1) 线性加点: iv + abs(drop_pct)/10 * iv_shock  (原逻辑)
+      2) 乘数放大: iv × multiplier  (按跌幅分段)
+           -10% → ×1.3
+           -20% → ×1.6
+           -30% → ×2.0
+           -40% 及以上 → ×2.5
+      取两者中的较大值。
+
+    BTC 上涨时 IV 温和下降, 仅用线性模式(缩半)。
+
+    Args:
+        iv: 当前 IV
+        drop_pct: BTC 价格变动百分比 (负=下跌)
+        iv_shock: 线性加点系数 (默认 0.10, 即每跌10%加10%绝对IV)
+
+    Returns:
+        压力场景下的 IV, 不低于 0.10
+    """
+    if drop_pct >= 0:
+        # BTC 上涨时 IV 温和下降
+        iv_decrease = abs(drop_pct) / 20 * iv_shock * 0.5
+        return max(iv - iv_decrease, 0.10)
+
+    abs_drop = abs(drop_pct)
+
+    # 模式1: 线性加点 (原有逻辑)
+    linear_iv = iv + abs_drop / 10 * iv_shock
+
+    # 模式2: 乘数放大 (按跌幅分段插值)
+    # 分段锚点: 0%→1.0, 10%→1.3, 20%→1.6, 30%→2.0, 40%+→2.5
+    breakpoints = [(0, 1.0), (10, 1.3), (20, 1.6), (30, 2.0), (40, 2.5)]
+    multiplier = breakpoints[-1][1]  # 默认最大段
+    for i in range(len(breakpoints) - 1):
+        low_drop, low_mult = breakpoints[i]
+        high_drop, high_mult = breakpoints[i + 1]
+        if abs_drop <= high_drop:
+            # 在此段内线性插值
+            frac = (abs_drop - low_drop) / (high_drop - low_drop)
+            multiplier = low_mult + frac * (high_mult - low_mult)
+            break
+
+    mult_iv = iv * multiplier
+
+    return max(linear_iv, mult_iv, 0.10)
+
+
 def stress_test_portfolio(positions: list, spot: float,
                           account_balance: float,
                           scenarios: list[float] = None,
@@ -200,10 +254,8 @@ def stress_test_portfolio(positions: list, spot: float,
             entry = p.get("entry_price", 0)
             current_mark = p.get("mark_price", 0)
 
-            # IV 在下跌时上升 (vol-of-vol 效应)
-            # 经验公式: BTC每跌10%, Put IV 约上升 +8%绝对值
-            iv_increase = abs(drop_pct) / 10 * iv_shock if drop_pct < 0 else -abs(drop_pct) / 20 * iv_shock * 0.5
-            stressed_iv = max(iv + iv_increase, 0.10)
+            # IV 冲击: 双模式取大 (线性加点 vs 乘数放大)
+            stressed_iv = _calc_stressed_iv(iv, drop_pct, iv_shock)
 
             # BS 定价计算压力下的期权价格
             stressed_price = bs_put_price(stressed_spot, strike, dte, stressed_iv)
@@ -302,8 +354,7 @@ def estimate_liquidation_price(positions: list, spot: float,
             iv = p.get("iv", 0.40)
             entry = p.get("entry_price", 0)
 
-            iv_increase = abs(drop_pct) / 10 * iv_shock if drop_pct < 0 else 0
-            stressed_iv = max(iv + iv_increase, 0.10)
+            stressed_iv = _calc_stressed_iv(iv, drop_pct, iv_shock)
             stressed_price = bs_put_price(test_spot, strike, dte, stressed_iv)
 
             pnl = (entry - stressed_price) * abs_qty
@@ -320,8 +371,7 @@ def estimate_liquidation_price(positions: list, spot: float,
             iv = p.get("iv", 0.40)
             entry = p.get("entry_price", 0)
 
-            iv_increase = abs(drop_pct) / 10 * iv_shock if drop_pct < 0 else 0
-            stressed_iv = max(iv + iv_increase, 0.10)
+            stressed_iv = _calc_stressed_iv(iv, drop_pct, iv_shock)
             stressed_price = bs_put_price(test_spot, strike, dte, stressed_iv)
 
             pnl = (stressed_price - entry) * abs_qty
@@ -369,8 +419,7 @@ def estimate_liquidation_price(positions: list, spot: float,
         iv = p.get("iv", 0.40)
         entry = p.get("entry_price", 0)
 
-        iv_increase = abs(liq_drop) / 10 * iv_shock
-        stressed_iv = max(iv + iv_increase, 0.10)
+        stressed_iv = _calc_stressed_iv(iv, liq_drop, iv_shock)
         stressed_price = bs_put_price(liq_price, strike, dte, stressed_iv)
         pnl = (entry - stressed_price) * abs_qty
 
