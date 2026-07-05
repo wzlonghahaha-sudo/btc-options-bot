@@ -653,9 +653,12 @@ class MessageFormatter:
             "/top70 - ⭐ 看70+以上机会\n"
             "/overview - 发送完整市场概览\n"
             "/ai - 🤖 AI 策略分析 (Claude)\n"
+            "/payoff - 📈 组合到期 Payoff 图\n"
             "/hedge - 🛡️ 对冲方案计算\n"
             "/perf - 📊 策略绩效统计\n"
             "/journal - 📝 最近交易记录\n"
+            "/config - ⚙️ 查看可调参数\n"
+            "/set - ⚙️ 修改参数 (如 /set scan_interval 120)\n"
             "/strategy - 📖 策略说明 (小白版)\n"
             "/rules - 📏 具体入场/风控规则\n"
             "/help - 显示此帮助\n\n"
@@ -1818,6 +1821,96 @@ class MonitorService:
                             f"{hit['acted_on']}条入场 ({hit['hit_rate']:.0f}%)"
                         )
                     self.tg.send("\n".join(lines))
+
+    # --- P2-3: /config & /set 命令 ---
+    def _cmd_config(self):
+        """显示所有可调参数及当前值"""
+        lines = ["⚙️ <b>可调参数</b>\n"]
+        for name, spec in ADJUSTABLE_PARAMS.items():
+            # 当前值: runtime_config 优先, 否则用默认值
+            if name in runtime_config:
+                val = runtime_config[name]
+                source = "✏️"  # 已调整
+            else:
+                val = self._get_param_default(name)
+                source = "📌"  # 默认值
+            lines.append(
+                f"{source} <code>{name}</code> = <b>{val}</b>\n"
+                f"    {spec['desc']}  [{spec['type'].__name__}  {spec['min']}~{spec['max']}]"
+            )
+        lines.append("\n用法: <code>/set 参数名 值</code>")
+        lines.append("示例: <code>/set scan_interval 120</code>")
+        self.tg.send("\n".join(lines))
+
+    def _cmd_set(self, text: str):
+        """验证并设置运行时参数"""
+        global runtime_config
+        parts = text.split(None, 2)  # "/set", "param", "value"
+        if len(parts) < 3:
+            self.tg.send("❌ 用法: <code>/set 参数名 值</code>\n\n发送 /config 查看可调参数")
+            return
+
+        param_name = parts[1].strip()
+        raw_value = parts[2].strip()
+
+        # 检查白名单
+        if param_name not in ADJUSTABLE_PARAMS:
+            valid = ", ".join(ADJUSTABLE_PARAMS.keys())
+            self.tg.send(f"❌ 未知参数: <code>{param_name}</code>\n\n可调参数: {valid}")
+            return
+
+        spec = ADJUSTABLE_PARAMS[param_name]
+
+        # 类型转换
+        try:
+            value = spec["type"](raw_value)
+        except (ValueError, TypeError):
+            self.tg.send(
+                f"❌ 类型错误: <code>{param_name}</code> 需要 {spec['type'].__name__}\n"
+                f"输入值: {raw_value}"
+            )
+            return
+
+        # 范围检查
+        if value < spec["min"] or value > spec["max"]:
+            self.tg.send(
+                f"❌ 超出范围: <code>{param_name}</code>\n"
+                f"允许: {spec['min']} ~ {spec['max']}, 输入: {value}"
+            )
+            return
+
+        # 保存旧值
+        old_val = runtime_config.get(param_name, self._get_param_default(param_name))
+
+        # 更新
+        runtime_config[param_name] = value
+
+        # 应用到模块级变量
+        self._apply_runtime_config()
+
+        # 持久化
+        self.state.save_runtime_config(runtime_config)
+        self.state.save(force=True)
+
+        self.tg.send(
+            f"✅ <b>参数已更新</b>\n\n"
+            f"<code>{param_name}</code>: {old_val} → <b>{value}</b>\n"
+            f"({spec['desc']})"
+        )
+        log.info(f"运行时调参: {param_name} = {value} (原 {old_val})")
+
+    def _get_param_default(self, name: str):
+        """获取参数的默认值"""
+        defaults = {
+            "scan_interval": 180,
+            "overview_interval": 4 * 3600,
+            "score_push": getattr(ScanConfig, "SCORE_PUSH", 78),
+            "pnl_warn_ratio": 1.0,
+            "pnl_danger_ratio": 2.0,
+            "liq_warning_pct": 18,
+            "daily_digest_hour": 0,
+        }
+        return defaults.get(name, "?")
 
     def _process_hedge_alerts(self, result: dict):
         """检查是否需要推送对冲建议"""

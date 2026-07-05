@@ -132,6 +132,15 @@ class StatePersistence:
     def load_update_offset(self) -> int:
         return self.data.get("update_offset", 0)
 
+    # --- 运行时调参 (P2-3) ---
+    def save_runtime_config(self, config: dict):
+        """保存运行时可调参数"""
+        self.data["runtime_config"] = config
+
+    def load_runtime_config(self) -> dict:
+        """加载运行时可调参数"""
+        return self.data.get("runtime_config", {})
+
     # --- IV 曲面快照 ---
     def save_iv_surface_snapshot(self, iv_surface: dict, timestamp: float):
         """保存 IV 曲面快照 (用于历史分析)"""
