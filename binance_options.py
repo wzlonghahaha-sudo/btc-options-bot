@@ -25,6 +25,7 @@ API文档: https://binance-docs.github.io/apidocs/voptions/en/
 
 import hashlib
 import hmac
+import logging
 import os
 import time
 import requests
@@ -38,9 +39,18 @@ load_dotenv()
 
 BASE_URL = "https://eapi.binance.com"
 
+_log = logging.getLogger(__name__)
+
+# 可重试的 HTTP 状态码
+_RETRYABLE_STATUS = frozenset({429, 418, 500, 502, 503, 504})
+
 
 class BinanceOptionsAPI:
     """币安期权 API 封装（支持公开接口 + 鉴权私有接口）"""
+
+    # 重试配置
+    MAX_RETRIES = 3
+    RETRY_BASE_DELAY = 1  # 秒
 
     def __init__(self, api_key: str = None, secret_key: str = None):
         self.api_key = api_key or os.getenv("BINANCE_API_KEY", "")
@@ -50,9 +60,30 @@ class BinanceOptionsAPI:
             "Accept": "application/json",
         })
 
+        # serverTime 校准: 计算本地时钟与服务器时钟的偏移量 (ms)
+        self._time_offset_ms = 0
+        self._calibrate_server_time()
+
+    def _calibrate_server_time(self) -> None:
+        """启动时校准本地时钟与币安服务器时钟 (仅调用一次)"""
+        try:
+            local_before = int(time.time() * 1000)
+            resp = self.session.get(f"{BASE_URL}/eapi/v1/time", timeout=5)
+            resp.raise_for_status()
+            server_time = resp.json().get("serverTime", 0)
+            local_after = int(time.time() * 1000)
+            # 取请求往返中点作为本地参考时间
+            local_mid = (local_before + local_after) // 2
+            self._time_offset_ms = server_time - local_mid
+            _log.info(f"serverTime 校准成功, offset={self._time_offset_ms}ms")
+        except Exception as e:
+            _log.warning(f"serverTime 校准失败, 使用本地时间: {e}")
+            self._time_offset_ms = 0
+
     def _sign(self, params: dict) -> dict:
-        """为请求参数生成 HMAC SHA256 签名"""
-        params["timestamp"] = int(time.time() * 1000)
+        """为请求参数生成 HMAC SHA256 签名 (使用校准后的时间戳)"""
+        params["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
+        params["recvWindow"] = 10000
         query_string = urlencode(params)
         signature = hmac.new(
             self.secret_key.encode("utf-8"),
@@ -62,40 +93,98 @@ class BinanceOptionsAPI:
         params["signature"] = signature
         return params
 
-    def _get(self, endpoint: str, params: dict = None, signed: bool = False) -> dict | list:
-        """发送 GET 请求"""
+    def _request(self, method: str, endpoint: str, params: dict = None,
+                 signed: bool = False) -> dict | list:
+        """
+        统一 HTTP 请求方法, 带指数退避重试。
+
+        重试策略:
+          - 最多 MAX_RETRIES 次
+          - 指数退避: delay = RETRY_BASE_DELAY * 2^attempt
+          - 仅对网络错误 (ConnectionError, Timeout), HTTP 5xx, 429/418 重试
+          - 429/418: 读取 Retry-After 头决定等待时长
+          - 4xx (除 429/418) 和认证错误不重试
+        """
         url = f"{BASE_URL}{endpoint}"
         headers = {}
         if signed:
             if not self.api_key or not self.secret_key:
                 raise ValueError("需要 API Key 和 Secret Key 才能调用私有接口")
             headers["X-MBX-APIKEY"] = self.api_key
-            params = self._sign(params or {})
-        resp = self.session.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+
+        last_exception = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                # 签名必须在每次重试时重新生成 (timestamp 会变)
+                req_params = dict(params) if params else {}
+                if signed:
+                    req_params = self._sign(req_params)
+
+                resp = self.session.request(
+                    method, url, params=req_params, headers=headers, timeout=10
+                )
+
+                # 成功
+                if resp.ok:
+                    return resp.json()
+
+                # 判断是否可重试
+                status = resp.status_code
+                if status in _RETRYABLE_STATUS:
+                    last_exception = requests.exceptions.HTTPError(
+                        f"{status} {resp.reason}", response=resp
+                    )
+                    # 429/418: 优先使用 Retry-After 头
+                    if status in (429, 418):
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            wait = int(retry_after)
+                        else:
+                            wait = self.RETRY_BASE_DELAY * (2 ** attempt)
+                        _log.warning(
+                            f"HTTP {status} on {endpoint}, "
+                            f"Retry-After={retry_after}, sleeping {wait}s "
+                            f"(attempt {attempt + 1}/{self.MAX_RETRIES})"
+                        )
+                    else:
+                        wait = self.RETRY_BASE_DELAY * (2 ** attempt)
+                        _log.warning(
+                            f"HTTP {status} on {endpoint}, "
+                            f"sleeping {wait}s "
+                            f"(attempt {attempt + 1}/{self.MAX_RETRIES})"
+                        )
+                    time.sleep(wait)
+                    continue
+
+                # 不可重试的 4xx — 直接抛出
+                resp.raise_for_status()
+
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                last_exception = e
+                wait = self.RETRY_BASE_DELAY * (2 ** attempt)
+                _log.warning(
+                    f"Network error on {endpoint}: {e}, "
+                    f"sleeping {wait}s "
+                    f"(attempt {attempt + 1}/{self.MAX_RETRIES})"
+                )
+                time.sleep(wait)
+                continue
+
+        # 所有重试耗尽
+        raise last_exception  # type: ignore[misc]
+
+    def _get(self, endpoint: str, params: dict = None, signed: bool = False) -> dict | list:
+        """发送 GET 请求"""
+        return self._request("GET", endpoint, params=params, signed=signed)
 
     def _post(self, endpoint: str, params: dict = None) -> dict | list:
         """发送签名 POST 请求"""
-        if not self.api_key or not self.secret_key:
-            raise ValueError("需要 API Key 和 Secret Key 才能调用私有接口")
-        url = f"{BASE_URL}{endpoint}"
-        headers = {"X-MBX-APIKEY": self.api_key}
-        params = self._sign(params or {})
-        resp = self.session.post(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request("POST", endpoint, params=params, signed=True)
 
     def _delete(self, endpoint: str, params: dict = None) -> dict | list:
         """发送签名 DELETE 请求"""
-        if not self.api_key or not self.secret_key:
-            raise ValueError("需要 API Key 和 Secret Key 才能调用私有接口")
-        url = f"{BASE_URL}{endpoint}"
-        headers = {"X-MBX-APIKEY": self.api_key}
-        params = self._sign(params or {})
-        resp = self.session.delete(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request("DELETE", endpoint, params=params, signed=True)
 
     # ============================================================
     #  公开接口 (Market Data - 无需 API Key)
@@ -299,11 +388,6 @@ class BinanceOptionsAPI:
 # ========================
 # 辅助函数
 # ========================
-
-import logging as _logging
-
-_log = _logging.getLogger(__name__)
-
 
 def get_account_equity(api: "BinanceOptionsAPI") -> dict:
     """
