@@ -60,6 +60,7 @@ from ai_analyst import SmartAnalyst
 from trade_journal import TradeJournal, SignalRecord
 from state_persistence import StatePersistence
 from hedge_advisor import HedgeAdvisor, RiskMode
+from daily_digest import generate_daily_digest
 
 load_dotenv()
 
@@ -73,6 +74,9 @@ TG_GROUP_IDS = [g.strip() for g in os.getenv("TG_GROUP_IDS", "").split(",") if g
 
 # 外部心跳 (Dead Man's Switch)
 HEARTBEAT_URL = os.getenv("HEARTBEAT_URL", "")
+
+# 每日 Digest 推送时间 (UTC 小时, 默认 0 = HK 8:00)
+DAILY_DIGEST_HOUR_UTC = int(os.getenv("DAILY_DIGEST_HOUR_UTC", "0"))
 
 # 扫描间隔
 SCAN_INTERVAL_NORMAL = 180       # 常规: 3分钟
@@ -88,6 +92,39 @@ SIGNAL_UPGRADE_COOLDOWN = 60     # 信号升级60秒去重
 POS_WARN_COOLDOWN = 1800         # 持仓WARNING 30分钟
 POS_DANGER_COOLDOWN = 300        # 持仓DANGER 5分钟
 
+# ============================================================
+#  可调参数白名单 (P2-3)
+# ============================================================
+ADJUSTABLE_PARAMS = {
+    "scan_interval": {"type": int, "min": 30, "max": 600, "desc": "扫描间隔(秒)"},
+    "overview_interval": {"type": int, "min": 1800, "max": 14400, "desc": "概览间隔(秒)"},
+    "score_push": {"type": int, "min": 50, "max": 95, "desc": "自动推送评分门槛"},
+    "pnl_warn_ratio": {"type": float, "min": 0.5, "max": 5.0, "desc": "浮亏警告倍数"},
+    "pnl_danger_ratio": {"type": float, "min": 1.0, "max": 10.0, "desc": "浮亏危险倍数"},
+    "liq_warning_pct": {"type": int, "min": 10, "max": 50, "desc": "强平距离警告%"},
+    "daily_digest_hour": {"type": int, "min": 0, "max": 23, "desc": "日报推送UTC小时"},
+}
+
+# 运行时配置 (从 bot_state.json 加载, 通过 /set 修改)
+runtime_config: dict = {}
+
+# 参数名 → 对应的模块级全局变量名 (用于 get_runtime_param 默认值)
+_PARAM_DEFAULTS = {
+    "scan_interval": "SCAN_INTERVAL_NORMAL",
+    "overview_interval": "OVERVIEW_INTERVAL",
+    "score_push": None,       # 无直接全局变量, 使用 ScanConfig.SCORE_PUSH
+    "pnl_warn_ratio": None,
+    "pnl_danger_ratio": None,
+    "liq_warning_pct": None,
+    "daily_digest_hour": None,
+}
+
+
+def get_runtime_param(name: str, default=None):
+    """获取运行时参数值: 优先 runtime_config, 否则用 default"""
+    return runtime_config.get(name, default)
+
+
 # 日志
 logging.basicConfig(
     level=logging.INFO,
@@ -95,6 +132,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("tg_bot")
+
+# 告警确认按钮
+ALERT_ACK_BUTTONS = [
+    {"text": "已处理 ✅", "callback_data": "ack_alert"},
+    {"text": "静音1h 🔇", "callback_data": "mute_1h"},
+]
 
 
 # ============================================================
@@ -256,6 +299,41 @@ class TelegramBot:
                     chunks.append(current)
                 for chunk in chunks:
                     self._send_to(group_id, chunk, parse_mode, silent)
+
+    def send_with_buttons(self, chat_id: str, text: str, buttons: list,
+                          parse_mode: str = "HTML") -> bool:
+        """发送带 inline keyboard 按钮的消息"""
+        try:
+            reply_markup = {
+                "inline_keyboard": [
+                    [{"text": btn["text"], "callback_data": btn["callback_data"]}
+                     for btn in buttons]
+                ]
+            }
+            resp = self.session.post(
+                f"{self.api_base}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                    "reply_markup": reply_markup,
+                },
+                timeout=10,
+            )
+            if not resp.json().get("ok"):
+                log.error(f"TG send_with_buttons failed: {resp.text}")
+                return False
+            return True
+        except Exception as e:
+            log.error(f"TG send_with_buttons error: {e}")
+            return False
+
+    def broadcast_with_buttons(self, text: str, buttons: list,
+                                parse_mode: str = "HTML", silent: bool = False):
+        """广播带按钮的消息: 发到主 chat + 所有群组"""
+        self.send_with_buttons(self.chat_id, text, buttons, parse_mode)
+        for group_id in TG_GROUP_IDS:
+            self.send_with_buttons(group_id, text, buttons, parse_mode)
 
     def broadcast_photo(self, photo_path: str, caption: str = "", parse_mode: str = "HTML"):
         """广播图片: 发到主 chat + 所有群组"""
@@ -807,6 +885,7 @@ class MonitorService:
 
         self.running = True
         self.update_offset = 0
+        self.last_digest_date = None  # 每日 digest 去重: 记录上次发送日期
 
         # P1-4: 恢复持久化状态
         self._restore_state()
@@ -842,6 +921,15 @@ class MonitorService:
                 self.update_offset = offset
                 log.info(f"恢复 TG offset: {offset}")
 
+            # P2-3: 恢复运行时调参
+            global runtime_config
+            saved_cfg = self.state.load_runtime_config()
+            if saved_cfg:
+                runtime_config.update(saved_cfg)
+                log.info(f"恢复运行时配置: {saved_cfg}")
+                # 应用 scan_interval / overview_interval 到模块级变量
+                self._apply_runtime_config()
+
         except Exception as e:
             log.warning(f"状态恢复失败: {e}")
 
@@ -853,9 +941,19 @@ class MonitorService:
             self.state.save_price_tracker(pt.prices, pt.daily_open, pt.daily_open_date)
             self.state.save_risk_cooldowns(self.risk_engine.last_alerts)
             self.state.save_update_offset(self.update_offset)
+            self.state.save_runtime_config(runtime_config)
             self.state.save()
         except Exception as e:
             log.error(f"状态保存失败: {e}")
+
+    def _apply_runtime_config(self):
+        """将 runtime_config 中的值应用到模块级变量"""
+        global SCAN_INTERVAL_NORMAL, OVERVIEW_INTERVAL
+        if "scan_interval" in runtime_config:
+            SCAN_INTERVAL_NORMAL = runtime_config["scan_interval"]
+            self.current_interval = SCAN_INTERVAL_NORMAL
+        if "overview_interval" in runtime_config:
+            OVERVIEW_INTERVAL = runtime_config["overview_interval"]
 
     def uptime_str(self) -> str:
         elapsed = time.time() - self.start_time
@@ -1094,14 +1192,26 @@ class MonitorService:
 
     def process_pos_alerts(self, pos_alerts: list):
         """处理持仓预警"""
+        # 检查是否被用户静音/确认
+        now = time.time()
+        ack_until = self.cooldown.signal_sent.get("_ack_alert", {}).get("time", 0)
+        mute_until = self.cooldown.signal_sent.get("_mute_1h", {}).get("time", 0)
+
         for p in pos_alerts:
             alert = p.get("alert", "OK")
             if alert not in ("WARNING", "DANGER"):
                 continue
             sym = p.get("symbol", "")
             if self.cooldown.should_send_pos_alert(sym, alert):
+                # 如果被用户静音/确认, 跳过 DANGER 推送
+                if alert == "DANGER" and (now < ack_until or now < mute_until):
+                    log.info(f"持仓预警 {sym} [{alert}] 被用户静音, 跳过")
+                    continue
                 msg = self.fmt.position_alert(p)
-                self.tg.broadcast(msg, silent=(alert == "WARNING"))
+                if alert == "DANGER":
+                    self.tg.broadcast_with_buttons(msg, ALERT_ACK_BUTTONS)
+                else:
+                    self.tg.broadcast(msg, silent=True)
                 self.cooldown.record_pos_alert(sym, alert)
                 log.info(f"推送持仓预警: {sym} [{alert}]")
 
@@ -1114,10 +1224,24 @@ class MonitorService:
         if not pushable:
             return
 
+        # 检查是否被用户静音/确认
+        now = time.time()
+        ack_until = self.cooldown.signal_sent.get("_ack_alert", {}).get("time", 0)
+        mute_until = self.cooldown.signal_sent.get("_mute_1h", {}).get("time", 0)
+        if now < ack_until or now < mute_until:
+            log.info(f"告警已被用户静音, 跳过推送 ({len(pushable)} 项)")
+            return
+
         msg = format_risk_alerts(pushable)
         # CRITICAL 不静默
         silent = all(a.level == "WARNING" for a in pushable)
-        self.tg.broadcast(msg, silent=silent)
+
+        has_critical_or_danger = any(
+            a.level in ("CRITICAL", "DANGER") for a in pushable)
+        if has_critical_or_danger:
+            self.tg.broadcast_with_buttons(msg, ALERT_ACK_BUTTONS, silent=silent)
+        else:
+            self.tg.broadcast(msg, silent=silent)
         log.info(f"推送风控告警: {len(pushable)} 项 "
                  f"(C:{len([a for a in pushable if a.level=='CRITICAL'])} "
                  f"D:{len([a for a in pushable if a.level=='DANGER'])} "
@@ -1318,6 +1442,45 @@ class MonitorService:
 
         for update in updates:
             self.update_offset = update["update_id"] + 1
+
+            # --- 处理 inline keyboard 回调 ---
+            if "callback_query" in update:
+                cq = update["callback_query"]
+                callback_data = cq.get("data", "")
+                cq_id = cq["id"]
+                cq_chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+
+                # 只响应授权用户
+                if cq_chat_id != TG_CHAT_ID:
+                    continue
+
+                # 确认回调
+                try:
+                    self.tg.session.post(
+                        f"{self.tg.api_base}/answerCallbackQuery",
+                        json={"callback_query_id": cq_id, "text": "已确认"},
+                        timeout=5,
+                    )
+                except Exception as e:
+                    log.warning(f"answerCallbackQuery 失败: {e}")
+
+                now = time.time()
+                if callback_data == "ack_alert":
+                    # 确认告警: 24小时内不再推送
+                    self.cooldown.signal_sent["_ack_alert"] = {
+                        "signal": "ACK", "time": now + ACK_COOLDOWN
+                    }
+                    self.tg.send("✅ 告警已确认, 24小时内不再重复推送")
+                    log.info("用户确认告警, 静默24h")
+                elif callback_data == "mute_1h":
+                    # 静音1小时
+                    self.cooldown.signal_sent["_mute_1h"] = {
+                        "signal": "MUTE", "time": now + MUTE_COOLDOWN
+                    }
+                    self.tg.send("🔇 已静音1小时, 期间不再推送同类告警")
+                    log.info("用户静音告警1h")
+                continue
+
             msg = update.get("message", {})
             text = msg.get("text", "").strip()
             chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -1613,6 +1776,12 @@ class MonitorService:
                 else:
                     self.tg.send("⏳ 尚未完成首次扫描")
 
+            elif text == "/config":
+                self._cmd_config()
+
+            elif text.startswith("/set "):
+                self._cmd_set(text)
+
             elif text == "/perf":
                 msg = self.journal.format_performance_tg()
                 self.tg.send(msg)
@@ -1851,6 +2020,21 @@ class MonitorService:
                 # 定期概览
                 if time.time() - self.last_overview_time > OVERVIEW_INTERVAL:
                     self.send_overview(result)
+
+                # 每日 Digest 推送
+                try:
+                    now_utc = datetime.now(timezone.utc)
+                    today_str = now_utc.strftime("%Y-%m-%d")
+                    if (now_utc.hour == DAILY_DIGEST_HOUR_UTC
+                            and self.last_digest_date != today_str):
+                        log.info("触发每日 Digest 推送")
+                        digest_msg = generate_daily_digest(
+                            self.api, self.risk_engine, self.state)
+                        self.tg.broadcast(digest_msg, silent=True)
+                        self.last_digest_date = today_str
+                        log.info("每日 Digest 已推送")
+                except Exception as e:
+                    log.error(f"每日 Digest 推送失败: {e}")
 
                 # 定期清理
                 if self.scan_count % 100 == 0:
