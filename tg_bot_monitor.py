@@ -1785,6 +1785,65 @@ class MonitorService:
             elif text.startswith("/set "):
                 self._cmd_set(text)
 
+            elif text == "/payoff":
+                if self.last_result:
+                    self.tg.send("📈 正在生成 Payoff 图...")
+                    try:
+                        pos_alerts = self.last_result.get("pos_alerts", [])
+                        real_positions = [
+                            p for p in pos_alerts
+                            if p.get("type") == "POSITION" and p.get("qty", 0) != 0
+                        ]
+                        if not real_positions:
+                            self.tg.send("📋 当前无持仓, 无法生成 Payoff 图")
+                        else:
+                            # 构建 payoff_chart 所需的 positions 格式
+                            payoff_positions = []
+                            for p in real_positions:
+                                sym = p["symbol"]
+                                parts = sym.split("-")
+                                strike = float(parts[2]) if len(parts) >= 4 else 0
+                                payoff_positions.append({
+                                    "symbol": sym,
+                                    "qty": p["qty"],
+                                    "strike": strike,
+                                    "entry_price": p["entry"],
+                                })
+
+                            spot = self.last_result["data"]["spot"]
+
+                            # 获取强平价
+                            liq_price = None
+                            if self.hedge_advisor.last_liq_price > 0:
+                                liq_price = self.hedge_advisor.last_liq_price
+
+                            from payoff_chart import generate_payoff_chart
+                            chart_path = generate_payoff_chart(
+                                payoff_positions, spot,
+                                liq_price=liq_price,
+                                save_path="charts/payoff.png",
+                            )
+                            if chart_path:
+                                # 构建 caption
+                                n_short = sum(1 for p in real_positions if p["qty"] < 0)
+                                n_long = sum(1 for p in real_positions if p["qty"] > 0)
+                                caption = (
+                                    f"📈 <b>Portfolio Expiry Payoff</b>\n"
+                                    f"BTC ${spot:,.0f}  |  "
+                                    f"{n_short} Short + {n_long} Long"
+                                )
+                                if liq_price:
+                                    liq_pct = (liq_price / spot - 1) * 100
+                                    caption += f"\nLiq ${liq_price:,.0f} ({liq_pct:+.1f}%)"
+                                self.tg.send_photo(chart_path, caption=caption)
+                            else:
+                                self.tg.send("❌ Payoff 图生成失败")
+                    except Exception as e:
+                        log.error(f"Payoff 图生成失败: {e}", exc_info=True)
+                        self.tg.send(f"❌ Payoff 图生成失败: {e}")
+                else:
+                    self.tg.send("⏳ 尚未完成首次扫描")
+
             elif text == "/perf":
                 msg = self.journal.format_performance_tg()
                 self.tg.send(msg)
