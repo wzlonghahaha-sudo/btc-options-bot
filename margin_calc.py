@@ -230,7 +230,7 @@ def stress_test_portfolio(positions: list, spot: float,
         各场景的压力测试结果
     """
     if scenarios is None:
-        scenarios = [-5, -10, -15, -20, -25, -30]
+        scenarios = [-5, -10, -15, -20, -25, -30, -40, -50]
 
     results = []
 

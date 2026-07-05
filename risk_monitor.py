@@ -923,6 +923,7 @@ def format_risk_alerts(alerts: list[RiskAlert], full: bool = False,
         if stress:
             lines.append("━" * 35)
             lines.append("<b>📉 压力测试</b>")
+            lines.append("<i>IV冲击: 线性与乘数取大</i>")
             lines.append(f"{'场景':<12} {'BTC价格':>10} {'组合PnL':>10} {'保证金缺口':>10}")
             for sr in stress:
                 shortfall = f"${sr.margin_shortfall:,.0f}" if sr.margin_shortfall > 0 else "✅"
