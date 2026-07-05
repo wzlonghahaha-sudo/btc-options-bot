@@ -71,6 +71,9 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 # 额外推送群组 (逗号分隔多个)
 TG_GROUP_IDS = [g.strip() for g in os.getenv("TG_GROUP_IDS", "").split(",") if g.strip()]
 
+# 外部心跳 (Dead Man's Switch)
+HEARTBEAT_URL = os.getenv("HEARTBEAT_URL", "")
+
 # 扫描间隔
 SCAN_INTERVAL_NORMAL = 180       # 常规: 3分钟
 SCAN_INTERVAL_VOLATILE = 60      # 波动时: 1分钟
@@ -1764,6 +1767,15 @@ class MonitorService:
                 log.error(f"命令处理异常: {e}")
             time.sleep(1)  # 每秒检查一次, 保证秒回
 
+    def _ping_heartbeat(self):
+        """外部心跳 ping (Dead Man's Switch)"""
+        if not HEARTBEAT_URL:
+            return
+        try:
+            requests.get(HEARTBEAT_URL, timeout=5)
+        except Exception as e:
+            log.warning(f"Heartbeat ping failed: {e}")
+
     # --- 扫描线程 ---
     def _scan_loop(self):
         """独立线程: 按间隔扫描市场"""
@@ -1778,6 +1790,7 @@ class MonitorService:
             self.process_risk_alerts(result.get("risk_alerts", []))
             self.process_profit_advice(result.get("profit_analysis"))
             self.process_v2_signals(result)
+            self._ping_heartbeat()
         except Exception as e:
             log.error(f"首次扫描失败: {e}")
             self.tg.send(f"❌ 首次扫描失败: {e}")
@@ -1837,6 +1850,9 @@ class MonitorService:
                 # 定期清理
                 if self.scan_count % 100 == 0:
                     self.cooldown.cleanup()
+
+                # 外部心跳 ping
+                self._ping_heartbeat()
 
             except Exception as e:
                 log.error(f"扫描异常: {e}", exc_info=True)
