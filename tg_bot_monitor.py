@@ -1862,6 +1862,9 @@ class MonitorService:
             "发送 /help 查看可用命令"
         )
 
+        # 用日 K 线初始化日开盘价 (避免重启后失真)
+        self.risk_engine.price_tracker.init_daily_open_from_kline()
+
         def handle_exit(signum, frame):
             log.info("收到退出信号, 正在关闭...")
             self.running = False

@@ -18,6 +18,7 @@
 
 import time
 import math
+import logging
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from margin_calc import (
@@ -109,6 +110,9 @@ class RiskAlert:
 # ============================================================
 #  BTC 价格追踪器
 # ============================================================
+log = logging.getLogger(__name__)
+
+
 class PriceTracker:
     """追踪 BTC 价格变化"""
 
@@ -117,6 +121,32 @@ class PriceTracker:
         self.daily_open = None     # 当日开盘价
         self.daily_open_date = None
 
+    def init_daily_open_from_kline(self):
+        """
+        从币安 fapi 日 K 拉取当日 UTC 0 点真实开盘价
+
+        解决: 重启后首笔扫描价充当日开盘价 → 日内跌幅告警失真
+        复用 VolatilityAnalyzer.get_btc_daily_closes 的请求逻辑
+        """
+        import requests as _req
+        try:
+            r = _req.get(
+                "https://fapi.binance.com/fapi/v1/klines",
+                params={"symbol": "BTCUSDT", "interval": "1d", "limit": 1},
+                timeout=10,
+            )
+            klines = r.json()
+            if klines and len(klines) > 0:
+                real_open = float(klines[-1][1])  # index 1 = open price
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                self.daily_open = real_open
+                self.daily_open_date = today
+                log.info(f"日开盘价从 K 线初始化: ${real_open:,.2f} (UTC 0:00)")
+                return True
+        except Exception as e:
+            log.warning(f"从 K 线获取日开盘价失败: {e}")
+        return False
+
     def record(self, price: float):
         now = time.time()
         self.prices.append((now, price))
@@ -124,11 +154,13 @@ class PriceTracker:
         cutoff = now - 86400
         self.prices = [(t, p) for t, p in self.prices if t > cutoff]
 
-        # 更新日开盘
+        # 更新日开盘: 跨日时用 K 线校准, 失败才用首笔价
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.daily_open_date != today:
-            self.daily_open = price
-            self.daily_open_date = today
+            if not self.init_daily_open_from_kline():
+                # K 线获取失败, 降级用当前价
+                self.daily_open = price
+                self.daily_open_date = today
 
     def get_change_pct(self, window_seconds: int = 300) -> float:
         """获取最近 N 秒的变化百分比"""
