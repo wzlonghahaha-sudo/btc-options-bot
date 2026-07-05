@@ -18,9 +18,12 @@
 
 import math
 import time
+import logging
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from margin_calc import calc_put_margin_per_contract, calc_put_margin
+
+log = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -98,7 +101,8 @@ def assess_account_risk(api, data: dict) -> AccountRisk:
 
     try:
         positions = api.get_position()
-    except Exception:
+    except Exception as e:
+        log.warning(f"获取持仓失败: {e}")
         positions = []
 
     # 获取账户权益 (优先 API 直读, fallback 流水法)
@@ -450,8 +454,8 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
             ev_penalty, event_descs = score_penalty_for_events(
                 _date.today(), expiry_date.date() if hasattr(expiry_date, 'date') else expiry_date)
             score += ev_penalty
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"事件日历评分失败 [{sym}]: {e}")
 
         # === 账户风控评估 ===
         new_portfolio_delta = account.portfolio_delta + abs_delta
@@ -685,8 +689,8 @@ def format_signal_push(opps: list, account: AccountRisk) -> str:
         in_window, evt = is_pre_event_window(48)
         if in_window and evt:
             push_threshold += 10
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"事件窗口检查失败: {e}")
 
     top_opps = [o for o in opps if o.score >= push_threshold and o.can_open]
 

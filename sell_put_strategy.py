@@ -47,8 +47,11 @@
 
 import math
 import json
+import logging
 from datetime import datetime, timezone, timedelta
 from binance_options import BinanceOptionsAPI, ts_to_str
+
+log = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -123,8 +126,8 @@ def fetch_all_data(api: BinanceOptionsAPI) -> dict:
             oi_list = api.get_open_interest("BTC", exp)
             for oi in oi_list:
                 oi_map[oi["symbol"]] = float(oi.get("sumOpenInterest", 0))
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"OI 获取失败 [expiry={exp}]: {e} — 连续失败请关注")
 
     print(f"  OI 数据: {len(oi_map)} 条")
 
@@ -300,7 +303,8 @@ def analyze_put(symbol: str, data: dict, iv_stats: dict,
         from datetime import date as _date
         event_penalty, event_descs = score_penalty_for_events(
             _date.today(), expiry.date())
-    except Exception:
+    except Exception as e:
+        log.warning(f"事件日历加载失败: {e}")
         event_penalty, event_descs = 0, []
 
     # IV/HV 比率调整 (卖方核心 alpha)
@@ -443,6 +447,7 @@ def run_strategy(api: BinanceOptionsAPI = None) -> list[dict]:
             break  # 取第一个到期日的中位数作为近似
         vol_analysis = va.get_full_analysis(global_iv)
     except Exception as e:
+        log.warning(f"IV/HV 分析获取失败: {e}")
         print(f"  [!] IV/HV 分析获取失败: {e}")
 
     # 获取时序 IV Rank (用 iv_surface_history)
@@ -468,6 +473,7 @@ def run_strategy(api: BinanceOptionsAPI = None) -> list[dict]:
         else:
             print(f"  IV Rank: {rank_value:.0f}/100 (评分 {rank_score:.0f})")
     except Exception as e:
+        log.warning(f"IV Rank 获取失败: {e}")
         print(f"  [!] IV Rank 获取失败: {e}")
 
     print(f"\n开始分析 {len(data['btc_puts'])} 个 BTC Put 合约...")

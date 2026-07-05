@@ -16,12 +16,15 @@ import os
 import sys
 import math
 import time
+import logging
 import requests
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from binance_options import BinanceOptionsAPI
+
+log = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -51,7 +54,8 @@ class VolatilityAnalyzer:
             self._cache = {"closes": closes}
             self._cache_time = now
             return closes
-        except Exception:
+        except Exception as e:
+            log.warning(f"获取 BTC 日K数据失败: {e}")
             return []
 
     def calc_hv(self, window: int = 20) -> float:
@@ -447,7 +451,8 @@ def analyze_position_optimization(
     # 获取持仓
     try:
         positions = api.get_position()
-    except Exception:
+    except Exception as e:
+        log.warning(f"获取持仓失败: {e}")
         positions = []
 
     active_positions = [p for p in positions if float(p.get("quantity", 0)) != 0]

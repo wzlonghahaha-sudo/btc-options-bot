@@ -275,7 +275,8 @@ class TradeJournal:
                             trade_d["exit_reason"] = "expired"
                         else:
                             trade_d["exit_reason"] = "manual_close"
-                    except ValueError:
+                    except ValueError as e:
+                        log.warning(f"解析到期日失败 [{exp_str}]: {e}")
                         trade_d["exit_reason"] = "manual_close"
 
                 # 更新统计

@@ -185,7 +185,8 @@ class TelegramBot:
             )
             data = resp.json()
             return data.get("result", [])
-        except Exception:
+        except Exception as e:
+            log.warning(f"TG getUpdates 失败: {e}")
             return []
 
     def _send_to(self, chat_id: str, text: str, parse_mode: str = "HTML", silent: bool = False) -> bool:
@@ -924,7 +925,8 @@ class MonitorService:
         try:
             ma = self.api._get("/eapi/v1/marginAccount", signed=True)
             account_balance = float(ma["asset"][0]["marginBalance"])
-        except Exception:
+        except Exception as e:
+            log.warning(f"获取 marginAccount 余额失败: {e}")
             if account_risk:
                 account_balance = account_risk.available_margin + account_risk.used_margin
 
@@ -1024,8 +1026,8 @@ class MonitorService:
         # P2-11: 保存 IV 曲面快照
         try:
             self.state.save_iv_surface_snapshot(iv_surface, data["timestamp"])
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"保存 IV 曲面快照失败: {e}")
 
         # P0-1: 交易日志 — 检测持仓变化
         try:
@@ -1174,8 +1176,8 @@ class MonitorService:
                     source="v2",
                 )
                 self.journal.record_signal(sig)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"信号记录到交易日志失败 [{o.symbol}]: {e}")
 
         msg = format_signal_push(opps, account)
         if msg:
@@ -1242,8 +1244,8 @@ class MonitorService:
                 )
                 if resp.ok:
                     btc_24h_change = float(resp.json().get("priceChangePercent", 0))
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"获取 BTC 24h 涨跌幅失败: {e}")
 
         # 强平价一行 (如果有数据)
         liq_line = ""
@@ -1255,8 +1257,8 @@ class MonitorService:
                     "cushion": getattr(self.risk_engine, "_last_liq", {}).get("cushion", 0),
                 }
                 liq_line = self.hedge_advisor.format_liq_line(liq_data, result["data"]["spot"])
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"获取强平价信息失败: {e}")
 
         msg = self.fmt.market_overview(
             result["data"]["spot"],
@@ -1565,7 +1567,8 @@ class MonitorService:
                         try:
                             ma = self.api._get("/eapi/v1/marginAccount", signed=True)
                             balance = float(ma["asset"][0]["marginBalance"])
-                        except Exception:
+                        except Exception as e:
+                            log.warning(f"获取 marginAccount 余额失败 (hedge): {e}")
                             balance = 0
 
                         if balance <= 0:
@@ -1669,7 +1672,8 @@ class MonitorService:
                 try:
                     ma = self.api._get("/eapi/v1/marginAccount", signed=True)
                     account_balance = float(ma["asset"][0]["marginBalance"])
-                except Exception:
+                except Exception as e:
+                    log.warning(f"获取 marginAccount 余额失败 (hedge push): {e}")
                     return
 
             hedge_calc = self.hedge_advisor.calc_hedge_options(
@@ -1858,8 +1862,8 @@ class MonitorService:
                 log.error(f"扫描异常: {e}", exc_info=True)
                 try:
                     self.tg.send(f"⚠️ 扫描异常: {e}")
-                except Exception:
-                    pass
+                except Exception as e2:
+                    log.warning(f"扫描异常后 TG 通知也失败: {e2}")
                 time.sleep(30)
 
     # --- 主入口 ---
