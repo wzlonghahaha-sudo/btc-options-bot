@@ -14,12 +14,13 @@
 import os
 import json
 import time
+import tempfile
 import logging
 from datetime import datetime, timezone
 
 log = logging.getLogger("state")
 
-STATE_FILE = "/root/projects/bot_state.json"
+STATE_FILE = os.getenv("BOT_STATE_FILE", "./bot_state.json")
 
 
 class StatePersistence:
@@ -43,14 +44,21 @@ class StatePersistence:
         return {}
 
     def save(self, force: bool = False):
-        """保存状态 (默认每60秒一次)"""
+        """保存状态 (默认每60秒一次), 使用原子写防止中途损坏"""
         now = time.time()
         if not force and now - self._last_save < 60:
             return
         self.data["_save_time"] = now
+        dir_name = os.path.dirname(os.path.abspath(self.filepath))
         try:
-            with open(self.filepath, "w") as f:
-                json.dump(self.data, f, indent=2)
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(self.data, f, indent=2)
+                os.replace(tmp_path, self.filepath)
+            except:
+                os.unlink(tmp_path)
+                raise
             self._last_save = now
         except Exception as e:
             log.error(f"状态保存失败: {e}")

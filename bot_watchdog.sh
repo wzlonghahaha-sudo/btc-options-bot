@@ -31,6 +31,7 @@
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 PID_FILE="$SCRIPT_DIR/bot.pid"
 LOG_FILE="$SCRIPT_DIR/bot.log"
 CHECK_INTERVAL=60      # 每60秒检查一次

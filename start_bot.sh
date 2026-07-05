@@ -16,6 +16,7 @@
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 PID_FILE="$SCRIPT_DIR/bot.pid"
 LOG_FILE="$SCRIPT_DIR/bot.log"
 WATCHDOG_PID_FILE="$SCRIPT_DIR/watchdog.pid"
