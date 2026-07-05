@@ -597,32 +597,22 @@ class RiskEngine:
         # 是否有 Long Put 对冲
         has_hedge = portfolio_ctx.get("has_long_put", False) if portfolio_ctx else False
 
-        # === 1. 浮亏检查 ===
+        # === 1. 浮亏检查 (统一规则, 来自 risk_rules.py) ===
         pnl = (entry - mark_price) * abs_qty
         loss_ratio = (mark_price - entry) / entry if entry > 0 else 0
+        dist_strike = (spot - strike) / spot * 100 if spot > 0 else 0
+        abs_delta = abs(delta) * abs_qty
 
-        if loss_ratio >= cfg.PNL_CRITICAL_RATIO:
+        from risk_rules import evaluate_stop_loss
+        stop = evaluate_stop_loss(loss_ratio, dist_strike, abs(delta))
+
+        if stop.should_alert:
             alerts.append(RiskAlert(
-                level="CRITICAL", category="PNL", symbol=sym,
-                title=f"浮亏 {loss_ratio:.1f}x 权利金!",
-                detail=f"入场 ${entry:,.0f} → 当前 ${mark_price:,.0f}\n"
-                       f"浮亏 ${abs(pnl):,.0f} ({loss_ratio:.1f}x 权利金)",
-                action="强烈建议立即平仓止损!",
-            ))
-        elif loss_ratio >= cfg.PNL_DANGER_RATIO:
-            alerts.append(RiskAlert(
-                level="DANGER", category="PNL", symbol=sym,
+                level=stop.level, category="PNL", symbol=sym,
                 title=f"浮亏 {loss_ratio:.1f}x 权利金",
                 detail=f"入场 ${entry:,.0f} → 当前 ${mark_price:,.0f}\n"
-                       f"浮亏 ${abs(pnl):,.0f}",
-                action="认真考虑止损平仓",
-            ))
-        elif loss_ratio >= cfg.PNL_WARN_RATIO:
-            alerts.append(RiskAlert(
-                level="WARNING", category="PNL", symbol=sym,
-                title=f"浮亏 {loss_ratio:.1f}x 权利金",
-                detail=f"入场 ${entry:,.0f} → 当前 ${mark_price:,.0f}",
-                action="设好止损价位",
+                       f"浮亏 ${abs(pnl):,.0f}\n{stop.detail}",
+                action=stop.action,
             ))
 
         # === 2. 距行权价检查 ===

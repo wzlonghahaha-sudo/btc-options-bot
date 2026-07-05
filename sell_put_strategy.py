@@ -446,7 +446,7 @@ def print_results(results: list[dict], top_n: int = 15):
   2. 上述年化收益率基于保证金的粗略估算, 实际保证金可能更高
   3. IV 会突然飙升(如黑天鹅事件), 导致浮亏急剧扩大
   4. 建议单个合约不超过总仓位的 10-15%
-  5. 设置心理止损位: 当亏损达到收取权利金的 2-3 倍时考虑平仓
+  5. 设置止损: 期权价涨到 2.5x 时平仓 (复合条件详见 risk_rules.py)
   6. 避免在重大事件(如 FOMC, 减半等)前集中卖 Put
   7. Gamma 风险: 临近到期时, 如果接近行权价, PnL 波动会急剧放大
 """)
@@ -487,7 +487,9 @@ def quick_decision(results: list[dict], max_positions: int = 3):
         print(f"  最大收益: ${r['bid']:,.1f} / 张")
         margin_est = max(r['strike'], r['mark_price'] / abs(r['delta']) if r['delta'] != 0 else r['strike']) * Config.MARGIN_RATE
         print(f"  预估保证金: ~${margin_est:,.0f} / 张")
-        print(f"  建议止损: 当期权价格涨到 ${r['bid'] * 2.5:,.0f} 时平仓 (亏损约 1.5x 权利金)")
+        from risk_rules import get_stop_loss_price
+        stop_price = get_stop_loss_price(r['bid'])
+        print(f"  建议止损: 当期权价格涨到 ${stop_price:,.0f} 时平仓 (亏损约 {stop_price/r['bid'] - 1:.1f}x 权利金)")
 
     print(f"\n  ----")
     print(f"  组合总评分: {sum(p['total_score'] for p in picks) / len(picks):.1f}")
