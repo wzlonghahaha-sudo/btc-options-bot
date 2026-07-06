@@ -17,7 +17,12 @@ __pycache__/
 watchdog.log
 watchdog.pid
 
-# 其他项目和无关文件
+# 其他项目和无关文件 — 本仓库只包含 btc-options-bot 本体
+cerebras-ipo-monitor/
+vc-daily-report/
+*.xlsx
+account_pnl_analysis.py
+crypto_trading_tools_report.py
 opencode-telegram-bot/
 opencode-whatsapp-bridge/
 opencode-telegram-bot.env
