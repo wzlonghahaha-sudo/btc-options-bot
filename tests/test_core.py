@@ -290,3 +290,24 @@ class TestEventCalendar:
         expiry_date = date(2028, 1, 5)
         events = position_crosses_event(open_date, expiry_date)
         assert len(events) == 0
+
+    def test_fomc_dates_r2_1(self):
+        """R2-1: 验证 FOMC 日期已按官方日历修正"""
+        from event_calendar import EVENT_LIST
+        # 正确的 2026 FOMC 决议日 (官方确认)
+        correct_dates = [
+            (2026, 1, 28), (2026, 3, 18), (2026, 4, 29), (2026, 6, 17),
+            (2026, 7, 29), (2026, 9, 16), (2026, 10, 28), (2026, 12, 9),
+        ]
+        for d in correct_dates:
+            assert d in EVENT_LIST, f"正确日期 {d} 应存在于 EVENT_LIST"
+
+        # 旧的错误日期已删除
+        wrong_dates = [
+            (2026, 1, 29),   # 旧: 1/29 → 正确: 1/28
+            (2026, 5, 6),    # 不存在的 FOMC 会议
+            (2026, 11, 4),   # 旧: 11/4 → 正确: 10/28
+            (2026, 12, 16),  # 旧: 12/16 → 正确: 12/9
+        ]
+        for d in wrong_dates:
+            assert d not in EVENT_LIST, f"错误日期 {d} 不应存在于 EVENT_LIST"

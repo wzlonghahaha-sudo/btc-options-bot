@@ -11,6 +11,9 @@
 - CPI / 非农等经济数据发布日 (每月固定)
 - 比特币特有事件 (减半等, 已知日期)
 
+日期来源: federalreserve.gov/monetarypolicy/fomccalendars.htm
+更新时必须对照官网, 禁止推断。
+
 维护方式:
 - EVENT_LIST 为手动维护的 dict 常量
 - 事件列表过期(最近事件早于当前日期60天)时, 启动日志 + /status 警告
@@ -33,23 +36,25 @@ LOW = "LOW"         # 低影响事件 (PMI等), 仅作提醒
 #  事件列表 (手动维护)
 #  格式: (year, month, day) -> {"name": str, "level": str}
 #
-#  FOMC 2026 日程来源: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
-#  2026 FOMC 会议日期 (决议日, 即会议第二天):
-#    1/29, 3/18, 5/6, 6/17, 7/29, 9/16, 11/4, 12/16
+#  FOMC 2026 决议日 (两日会议的第二天, 即利率决议公布日)
+#  来源: federalreserve.gov/monetarypolicy/fomccalendars.htm
+#    Jan 27-28 → 1/28,  Mar 17-18 → 3/18 (SEP),
+#    Apr 28-29 → 4/29,  Jun 16-17 → 6/17 (SEP),
+#    Jul 28-29 → 7/29,  Sep 15-16 → 9/16 (SEP),
+#    Oct 27-28 → 10/28, Dec 8-9   → 12/9 (SEP)
+#
 #  CPI 发布日: 每月中旬 (BLS 公布, 具体日期每年不同)
 # ============================================================
 EVENT_LIST: dict[tuple[int, int, int], dict] = {
-    # === 2026 H2 FOMC 利率决议 ===
-    (2026, 7, 29): {"name": "FOMC 利率决议", "level": HIGH},
-    (2026, 9, 16): {"name": "FOMC 利率决议", "level": HIGH},
-    (2026, 11, 4): {"name": "FOMC 利率决议", "level": HIGH},
-    (2026, 12, 16): {"name": "FOMC 利率决议", "level": HIGH},
-
-    # === 2026 H1 FOMC (已过, 保留记录) ===
-    (2026, 1, 29): {"name": "FOMC 利率决议", "level": HIGH},
-    (2026, 3, 18): {"name": "FOMC 利率决议", "level": HIGH},
-    (2026, 5, 6):  {"name": "FOMC 利率决议", "level": HIGH},
-    (2026, 6, 17): {"name": "FOMC 利率决议", "level": HIGH},
+    # === 2026 FOMC 利率决议 (官方确认) ===
+    (2026, 1, 28):  {"name": "FOMC 利率决议", "level": HIGH},       # Jan 27-28
+    (2026, 3, 18):  {"name": "FOMC 利率决议 (SEP)", "level": HIGH}, # Mar 17-18
+    (2026, 4, 29):  {"name": "FOMC 利率决议", "level": HIGH},       # Apr 28-29
+    (2026, 6, 17):  {"name": "FOMC 利率决议 (SEP)", "level": HIGH}, # Jun 16-17
+    (2026, 7, 29):  {"name": "FOMC 利率决议", "level": HIGH},       # Jul 28-29
+    (2026, 9, 16):  {"name": "FOMC 利率决议 (SEP)", "level": HIGH}, # Sep 15-16
+    (2026, 10, 28): {"name": "FOMC 利率决议", "level": HIGH},       # Oct 27-28
+    (2026, 12, 9):  {"name": "FOMC 利率决议 (SEP)", "level": HIGH}, # Dec 8-9
 
     # === 2026 CPI 发布日 (月度, 日期为估计值, 实际以 BLS 公告为准) ===
     # TODO: 更新为 BLS 实际公布日期 (通常在每月 10-14 日)
@@ -60,10 +65,15 @@ EVENT_LIST: dict[tuple[int, int, int], dict] = {
     (2026, 11, 12): {"name": "CPI 数据发布", "level": HIGH},
     (2026, 12, 10): {"name": "CPI 数据发布", "level": HIGH},
 
-    # === 2027 Q1 FOMC (如已公布, 先占位) ===
-    # TODO: 等 2026 年底 Fed 公布 2027 日程后更新
-    (2027, 1, 27): {"name": "FOMC 利率决议 (预估)", "level": HIGH},
-    (2027, 3, 17): {"name": "FOMC 利率决议 (预估)", "level": HIGH},
+    # === 2027 FOMC (官方暂定版, tentative, 以 Fed 官网确认为准) ===
+    (2027, 1, 27):  {"name": "FOMC 利率决议 (tentative)", "level": HIGH},  # Jan 26-27
+    (2027, 3, 17):  {"name": "FOMC 利率决议 (tentative)", "level": HIGH},  # Mar 16-17
+    (2027, 4, 28):  {"name": "FOMC 利率决议 (tentative)", "level": HIGH},  # Apr 27-28
+    (2027, 6, 9):   {"name": "FOMC 利率决议 (tentative)", "level": HIGH},  # Jun 8-9
+    (2027, 7, 28):  {"name": "FOMC 利率决议 (tentative)", "level": HIGH},  # Jul 27-28
+    (2027, 9, 15):  {"name": "FOMC 利率决议 (tentative)", "level": HIGH},  # Sep 14-15
+    (2027, 10, 27): {"name": "FOMC 利率决议 (tentative)", "level": HIGH},  # Oct 26-27
+    (2027, 12, 8):  {"name": "FOMC 利率决议 (tentative)", "level": HIGH},  # Dec 7-8
 }
 
 
