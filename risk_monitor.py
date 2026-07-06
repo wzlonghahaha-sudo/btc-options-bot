@@ -461,14 +461,21 @@ class RiskEngine:
                     action="关注 BTC 走势",
                 ))
 
-        # 压力测试 (关键场景)
+        # 压力测试 (含极端场景 -40/-50)
         stress = stress_test_portfolio(pos_list, spot, account_balance,
-                                       scenarios=[-10, -20, -30])
+                                       scenarios=[-10, -20, -30, -40, -50])
         self._last_stress = stress
 
         for sr in stress:
             if sr.margin_shortfall > 0:
-                level = "DANGER" if sr.btc_drop_pct >= -20 else "WARNING"
+                # 分级: -30 及以内 → WARNING/DANGER (迫近风险)
+                #        -40/-50  → WATCH (极端情景提示, 避免刷屏)
+                if sr.btc_drop_pct >= -20:
+                    level = "DANGER"
+                elif sr.btc_drop_pct >= -30:
+                    level = "WARNING"
+                else:
+                    level = "WATCH"  # -40/-50 极端场景仅提示
                 alerts.append(RiskAlert(
                     level=level, category="MARGIN", symbol="PORTFOLIO",
                     title=f"压力测试: BTC{sr.scenario} 保证金缺口 ${sr.margin_shortfall:,.0f}",
