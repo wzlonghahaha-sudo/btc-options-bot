@@ -23,8 +23,17 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from binance_options import BinanceOptionsAPI
+from risk_rules import DIST_WARN_PCT  # 距行权价风险阈值 (统一来源)
 
 log = logging.getLogger(__name__)
+
+# 止盈特有参数 (与 risk_rules 的止损阈值无关, 保留在本模块)
+TP_UNCONDITIONAL_PCT = 90     # 已赚 90%+ → 无条件平仓
+TP_HIGH_PCT = 75              # 已赚 75%+ → 大概率平仓或 Roll
+TP_MEDIUM_PCT = 50            # 已赚 50%+ → 看情况
+TP_RISK_CLOSE_PCT = 40        # 安全垫不足时, 已赚 40%+ 也平仓
+TP_NO_EDGE_PCT = 60           # IV/HV 无 edge 时, 已赚 60%+ 平仓
+TP_DTE_GAMMA_DAYS = 7         # 临近到期的 gamma 区天数
 
 
 # ============================================================
@@ -171,32 +180,32 @@ def analyze_take_profit(
 
     # === 无条件平仓情况 ===
 
-    # DTE < 7 且已赚 50%+ → 平仓 (gamma区, 不值得)
-    if dte < 7 and profit_pct >= 50:
+    # DTE < gamma 区 且已赚一定比例 → 平仓 (不值得冒 gamma 风险)
+    if dte < TP_DTE_GAMMA_DAYS and profit_pct >= TP_MEDIUM_PCT:
         return TakeProfitAdvice(
             action="CLOSE", urgency="HIGH",
             reason=f"临近到期({dte:.0f}天) + 已赚 {profit_pct:.0f}%",
             detail=f"剩余 {dte:.0f} 天 Gamma 风险急升, 为 ${remaining_premium:.0f} 的剩余利润不值得冒险",
         )
 
-    # 已赚 90%+ → 无条件平仓
-    if profit_pct >= 90:
+    # 已赚 TP_UNCONDITIONAL_PCT+ → 无条件平仓
+    if profit_pct >= TP_UNCONDITIONAL_PCT:
         return TakeProfitAdvice(
             action="CLOSE", urgency="HIGH",
             reason=f"已赚 {profit_pct:.0f}%, 几乎吃满",
             detail=f"仅剩 ${remaining_premium:.0f} 未赚, 继续持有的风险收益比极差",
         )
 
-    # 距行权价 < 15% + 已赚 40%+ → 平仓
-    if dist_to_strike < 15 and profit_pct >= 40:
+    # 距行权价 < DIST_WARN_PCT + 已赚一定比例 → 平仓
+    if dist_to_strike < DIST_WARN_PCT and profit_pct >= TP_RISK_CLOSE_PCT:
         return TakeProfitAdvice(
             action="CLOSE", urgency="HIGH",
             reason=f"安全垫不足({dist_to_strike:.1f}%) + 已有 {profit_pct:.0f}% 盈利",
             detail=f"BTC 距行权价只有 {dist_to_strike:.1f}%, 风险在增加",
         )
 
-    # === 已赚 75%+ 的决策 ===
-    if profit_pct >= 75:
+    # === 已赚 TP_HIGH_PCT+ 的决策 ===
+    if profit_pct >= TP_HIGH_PCT:
         if has_signal_opportunities and best_opportunity:
             return TakeProfitAdvice(
                 action="CLOSE_AND_ROLL", urgency="HIGH",
@@ -215,8 +224,8 @@ def analyze_take_profit(
                        f"保证金闲置总比被黑天鹅打亏好",
             )
 
-    # === 已赚 50-75% 的决策 ===
-    if profit_pct >= 50:
+    # === 已赚 TP_MEDIUM_PCT ~ TP_HIGH_PCT 的决策 ===
+    if profit_pct >= TP_MEDIUM_PCT:
         if has_signal_opportunities and best_opportunity:
             return TakeProfitAdvice(
                 action="CLOSE_AND_ROLL", urgency="MEDIUM",
@@ -227,7 +236,7 @@ def analyze_take_profit(
 
         # 没有新机会 → 看 IV 趋势和 HV/IV 关系
         iv_hv_edge = vol_analysis.get("edge", "NONE")
-        if iv_hv_edge in ("NONE",) and profit_pct >= 60:
+        if iv_hv_edge in ("NONE",) and profit_pct >= TP_NO_EDGE_PCT:
             # IV 已经不比 HV 高了, 卖方优势消失
             return TakeProfitAdvice(
                 action="CLOSE", urgency="MEDIUM",
