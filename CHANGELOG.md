@@ -268,3 +268,79 @@ pytest: **30/30 passed** (0.02s)
 - 所有 12 个新建文件的 module docstring 和函数 docstring 均为中文
 - 代码内注释均为中文, 与现有代码风格一致
 - 变量名/函数名保持英文 (与现有代码一致)
+
+---
+
+## Round 2 审计整改
+
+整改时间: 2026-07-06
+pytest: **35/35 passed** (0.03s) — 含 R2-1 和 R2-2 新增 5 个测试
+
+### R2-1 🔴 修正 FOMC 日期 (事实错误)
+- **改动文件**: `event_calendar.py`, `tests/test_core.py`
+- **核心逻辑**: 按美联储官方日历逐一替换全部 2026 FOMC 决议日:
+  - (2026,1,29) → (2026,1,28), 删除 (2026,5,6), 新增 (2026,4,29),
+    (2026,11,4) → (2026,10,28), (2026,12,16) → (2026,12,9)
+  - 新增 2027 年全部 8 个日期 (标注 tentative)
+  - 文件头部加: "日期来源: federalreserve.gov, 更新时必须对照官网, 禁止推断"
+- **验证命令及预期输出**:
+  - `python3 -m pytest tests/test_core.py::TestEventCalendar::test_fomc_dates_r2_1 -v` → `PASSED`
+  - `python3 -c "from event_calendar import EVENT_LIST; assert (2026,10,28) in EVENT_LIST; assert (2026,11,4) not in EVENT_LIST; print('OK')"` → `OK`
+
+### R2-2 🔴 接线 emergency_hedge (死代码激活)
+- **改动文件**: `tg_bot_monitor.py`, `tests/test_core.py`
+- **核心逻辑**:
+  - MonitorService.__init__ 实例化 EmergencyHedge
+  - do_scan: CRITICAL MARGIN 告警 → record_critical_alert(), 每次循环 → check_and_act()
+  - ack_alert 回调 → emergency_hedge.record_ack()
+  - disabled 时纯 no-op (零 API 调用、零日志噪音, 仅启动时 log.info 一次)
+- **验证命令及预期输出**:
+  - `grep -c "from emergency_hedge import" tg_bot_monitor.py` → `1`
+  - `grep -c "emergency_hedge.check_and_act" tg_bot_monitor.py` → `1`
+  - `grep -c "emergency_hedge.record_ack" tg_bot_monitor.py` → `1`
+  - `grep -c "emergency_hedge.record_critical_alert" tg_bot_monitor.py` → `1`
+  - `python3 -m pytest tests/test_core.py::TestEmergencyHedge -v` → `4 passed`
+
+### R2-3 🟡 profit_optimizer 统一到 risk_rules
+- **改动文件**: `profit_optimizer.py`
+- **核心逻辑**: `dist_to_strike < 15` 改为 `import DIST_WARN_PCT from risk_rules`;
+  止盈特有阈值收敛为模块级常量 (TP_UNCONDITIONAL_PCT 等)
+- **验证命令及预期输出**:
+  - `grep -c "from risk_rules import" profit_optimizer.py` → `1`
+  - `grep -c "DIST_WARN_PCT" profit_optimizer.py` → `2` (import + 使用)
+  - `grep "< 15\b" profit_optimizer.py | grep -v "#\|DIST_\|TODO"` → (无输出)
+
+### R2-4 🟡 账户余额读取彻底统一
+- **改动文件**: `tg_bot_monitor.py`, `binance_options.py`, `daily_digest.py`
+- **核心逻辑**: tg_bot_monitor 3 处 + daily_digest 1 处直接 marginAccount 调用
+  全替换为 get_account_equity(); get_account_equity 内部遍历 asset 列表查找 USDT
+- **验证命令及预期输出**:
+  - `grep -n "ma\[.asset.\]\[0\]" tg_bot_monitor.py daily_digest.py` → (无输出)
+  - `grep "get_account_equity" tg_bot_monitor.py | wc -l` → `3`
+
+### R2-5 🟡 压测极端场景进入告警链路
+- **改动文件**: `risk_monitor.py`
+- **核心逻辑**: stress_test scenarios 从 [-10,-20,-30] 扩展到 [-10,-20,-30,-40,-50];
+  -40/-50 缺口 → WATCH 级 (不刷屏), -30 及以内维持 WARNING/DANGER
+- **验证命令及预期输出**:
+  - `grep "scenarios=" risk_monitor.py` → 含 `-40, -50`
+
+### R2-6 🧹 仓库卫生清理
+- **改动文件**: `.gitignore`, git rm --cached 20 个文件
+- **核心逻辑**: 移除 xlsx/无关 py/cerebras-ipo-monitor/vc-daily-report
+- **验证命令及预期输出**:
+  - `git ls-files | grep -c "cerebras\|vc-daily\|xlsx"` → `0`
+  - `grep "本仓库只包含" .gitignore` → 有匹配
+
+---
+
+## Round 2 自查声明
+
+1. **R2-1 FOMC 日期**: 逐一与 prompt 给出的 8 个日期比对 — 全部一致
+   (1/28, 3/18, 4/29, 6/17, 7/29, 9/16, 10/28, 12/9), 旧错误日期 (1/29, 5/6, 11/4, 12/16) 已删除。
+2. **R2-2 emergency_hedge 已接线**: grep 证明 import、check_and_act、record_critical_alert、
+   record_ack 四个调用点均存在于 tg_bot_monitor.py 中。
+3. **本轮无编造事实**: FOMC 日期来自 prompt 提供的官方确认清单, 未自行推断;
+   CPI 日期保持原有 TODO 标注。
+4. **本轮无虚报完成项**: 每项改动均有可复现的验证命令和预期输出,
+   "已完成"的定义是代码被真实调用 (grep 可证), 不是文件存在。
