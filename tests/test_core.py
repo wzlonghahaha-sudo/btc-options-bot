@@ -311,3 +311,83 @@ class TestEventCalendar:
         ]
         for d in wrong_dates:
             assert d not in EVENT_LIST, f"错误日期 {d} 不应存在于 EVENT_LIST"
+
+
+# ============================================================
+#  R2-2: EmergencyHedge 测试
+# ============================================================
+class TestEmergencyHedge:
+    """应急自动对冲 — mock API, 不触发真实网络"""
+
+    def _make_hedge(self, enabled=False, ack_timeout=1):
+        """创建 EmergencyHedge 实例 (mock 所有外部依赖)"""
+        import os
+        os.environ["EMERGENCY_AUTO_HEDGE"] = "true" if enabled else "false"
+        os.environ["EMERGENCY_MAX_HEDGE_COST_USDT"] = "1000"
+        os.environ["EMERGENCY_ACK_TIMEOUT_MIN"] = str(ack_timeout)
+
+        from unittest.mock import MagicMock
+        mock_api = MagicMock()
+        mock_api.place_order.return_value = {"orderId": "TEST123", "status": "FILLED"}
+        mock_tg = MagicMock()
+
+        mock_state = MagicMock()
+        mock_state.data = {}
+        mock_state.save = MagicMock()
+
+        # 必须在设完环境变量后才 import, 因为 __init__ 读 env
+        from emergency_hedge import EmergencyHedge
+        eh = EmergencyHedge(api=mock_api, tg_send_func=mock_tg, state_persistence=mock_state)
+        return eh, mock_api, mock_tg
+
+    def test_disabled_zero_calls(self):
+        """(a) disabled 时零调用"""
+        eh, mock_api, mock_tg = self._make_hedge(enabled=False)
+        result = eh.check_and_act(
+            liq_drop_pct=-10, pos_list=[], spot=60000,
+            account_balance=50000, available_puts=[], marks={},
+        )
+        assert result is None
+        mock_api.place_order.assert_not_called()
+        mock_tg.assert_not_called()  # disabled 不应产生任何 TG 消息
+
+    def test_enabled_ack_blocks(self):
+        """(c) 已 ACK → 不下单"""
+        eh, mock_api, _ = self._make_hedge(enabled=True, ack_timeout=0)
+        # 模拟: CRITICAL 告警已发送
+        eh.pending_emergency_alert_time = time.time() - 120  # 2分钟前
+        eh.emergency_acked = True  # 用户已确认
+        result = eh.check_and_act(
+            liq_drop_pct=-10, pos_list=[], spot=60000,
+            account_balance=50000, available_puts=[], marks={},
+        )
+        assert result is None
+        mock_api.place_order.assert_not_called()
+
+    def test_side_must_be_buy(self):
+        """(d) _execute_hedge 内的 side 断言"""
+        import inspect
+        from emergency_hedge import EmergencyHedge
+        source = inspect.getsource(EmergencyHedge._execute_hedge)
+        # 确认源码中有 assert side == "BUY"
+        assert 'assert side == "BUY"' in source, \
+            "EmergencyHedge._execute_hedge must contain assert side == 'BUY'"
+
+    def test_enabled_timeout_triggers(self):
+        """(b) enabled + 未 ACK + 超时 + 24h 内未执行 → 尝试执行"""
+        eh, mock_api, mock_tg = self._make_hedge(enabled=True, ack_timeout=0)
+        # 模拟: CRITICAL 告警已发送, 超时无 ACK
+        eh.pending_emergency_alert_time = time.time() - 120  # 超时
+        eh.emergency_acked = False
+        eh.last_auto_hedge_time = 0  # 从未执行
+
+        # check_and_act 会尝试 _execute_hedge, 但 calc_hedge_options 会失败
+        # (mock 没有设 hedge_advisor), 它会 catch Exception 并 TG 通知失败
+        result = eh.check_and_act(
+            liq_drop_pct=-10, pos_list=[], spot=60000,
+            account_balance=50000, available_puts=[], marks={},
+        )
+        # 由于 hedge_advisor.calc_hedge_options 会失败 (mock),
+        # 不会真正下单, 但证明了 all gates passed 并进入了 _execute_hedge
+        # mock_tg 应被调用 (要么报错消息, 要么预执行通知)
+        assert mock_tg.called, "TG should be called when all gates pass"

@@ -877,6 +877,14 @@ class MonitorService:
         self.hedge_advisor = HedgeAdvisor()
         self.risk_mode = RiskMode()
 
+        # 应急自动对冲 (opt-in, 默认关闭)
+        from emergency_hedge import EmergencyHedge
+        self.emergency_hedge = EmergencyHedge(
+            api=self.api,
+            tg_send_func=lambda text: self.tg.broadcast(text),
+            state_persistence=self.state,
+        )
+
         self.scan_count = 0
         self.start_time = time.time()
         self.last_spot = 0
@@ -1077,6 +1085,25 @@ class MonitorService:
                 for ea in exit_alerts:
                     self.tg.broadcast(ea["msg"])
                     log.info(f"对冲止盈提醒: {ea['short_sym']} ({ea['reason']})")
+
+            # 应急自动对冲: 检查是否需要触发
+            # 先检查是否有 CRITICAL 强平告警 → 启动 ACK 倒计时
+            has_critical_margin = any(
+                a.level == "CRITICAL" and a.category == "MARGIN"
+                for a in risk_alerts
+            )
+            if has_critical_margin:
+                self.emergency_hedge.record_critical_alert()
+
+            # 调用应急对冲评估 (disabled 时纯 no-op)
+            self.emergency_hedge.check_and_act(
+                liq_drop_pct=liq.get("liq_drop_pct", -100),
+                pos_list=pos_list,
+                spot=data["spot"],
+                account_balance=account_balance,
+                available_puts=list(data.get("marks", {}).values()),
+                marks=data.get("marks", {}),
+            )
 
         except Exception as e:
             log.error(f"对冲顾问失败: {e}")
@@ -1473,6 +1500,8 @@ class MonitorService:
                     self.cooldown.signal_sent["_ack_alert"] = {
                         "signal": "ACK", "time": now + ACK_COOLDOWN
                     }
+                    # 通知应急对冲模块: 用户已确认, 取消自动对冲
+                    self.emergency_hedge.record_ack()
                     self.tg.send("✅ 告警已确认, 24小时内不再重复推送")
                     log.info("用户确认告警, 静默24h")
                 elif callback_data == "mute_1h":
