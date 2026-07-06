@@ -412,7 +412,18 @@ def get_account_equity(api: "BinanceOptionsAPI") -> dict:
         raw = api._get("/eapi/v1/marginAccount", signed=True)
         asset_list = raw.get("asset", [])
         if isinstance(asset_list, list) and asset_list:
-            a = asset_list[0]
+            # 遍历查找 USDT 资产 (不依赖数组顺序)
+            a = None
+            for item in asset_list:
+                if item.get("asset") == "USDT":
+                    a = item
+                    break
+            if a is None:
+                # 找不到 USDT, 降级用第一个并警告
+                a = asset_list[0]
+                _log.warning(
+                    f"marginAccount 中未找到 USDT 资产, "
+                    f"降级使用 asset[0] (asset={a.get('asset', '?')})")
             return {
                 "equity": float(a.get("equity", 0)),
                 "margin_balance": float(a.get("marginBalance", 0)),

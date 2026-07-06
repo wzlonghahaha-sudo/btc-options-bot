@@ -70,8 +70,9 @@ def generate_daily_digest(api, risk_engine, state_persistence) -> str:
         log.warning(f"[digest] 获取 mark price 失败: {e}")
 
     try:
-        ma = api._get("/eapi/v1/marginAccount", signed=True)
-        account_balance = float(ma["asset"][0]["marginBalance"])
+        from binance_options import get_account_equity
+        _acct = get_account_equity(api)
+        account_balance = _acct["margin_balance"]
     except Exception as e:
         log.warning(f"[digest] 获取账户余额失败: {e}")
 

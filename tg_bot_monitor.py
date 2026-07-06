@@ -1029,15 +1029,12 @@ class MonitorService:
             log.error(f"v2机会扫描失败: {e}")
 
         # 风控检查 (含强平价格估算, 需要 account_balance)
-        # 优先用币安 marginAccount 的真实 marginBalance
-        account_balance = 0
-        try:
-            ma = self.api._get("/eapi/v1/marginAccount", signed=True)
-            account_balance = float(ma["asset"][0]["marginBalance"])
-        except Exception as e:
-            log.warning(f"获取 marginAccount 余额失败: {e}")
-            if account_risk:
-                account_balance = account_risk.available_margin + account_risk.used_margin
+        # 统一通过 get_account_equity() 获取 (R2-4)
+        from binance_options import get_account_equity
+        acct_info = get_account_equity(self.api)
+        account_balance = acct_info["margin_balance"]
+        if account_balance <= 0 and account_risk:
+            account_balance = account_risk.available_margin + account_risk.used_margin
 
         try:
             positions = self.api.get_position()
@@ -1759,12 +1756,9 @@ class MonitorService:
                     self.tg.send("🛡️ 计算对冲方案...")
                     try:
                         spot = self.last_result["data"]["spot"]
-                        try:
-                            ma = self.api._get("/eapi/v1/marginAccount", signed=True)
-                            balance = float(ma["asset"][0]["marginBalance"])
-                        except Exception as e:
-                            log.warning(f"获取 marginAccount 余额失败 (hedge): {e}")
-                            balance = 0
+                        from binance_options import get_account_equity
+                        _acct = get_account_equity(self.api)
+                        balance = _acct["margin_balance"]
 
                         if balance <= 0:
                             self.tg.send("❌ 无法获取账户余额")
@@ -2019,11 +2013,10 @@ class MonitorService:
             spot = result["data"]["spot"]
             account_balance = result.get("account_balance", 0)
             if not account_balance:
-                try:
-                    ma = self.api._get("/eapi/v1/marginAccount", signed=True)
-                    account_balance = float(ma["asset"][0]["marginBalance"])
-                except Exception as e:
-                    log.warning(f"获取 marginAccount 余额失败 (hedge push): {e}")
+                from binance_options import get_account_equity
+                _acct = get_account_equity(self.api)
+                account_balance = _acct["margin_balance"]
+                if account_balance <= 0:
                     return
 
             hedge_calc = self.hedge_advisor.calc_hedge_options(
