@@ -617,6 +617,25 @@ def quick_decision(results: list[dict], max_positions: int = 3):
         from risk_rules import get_stop_loss_price
         stop_price = get_stop_loss_price(r['bid'])
         print(f"  建议止损: 当期权价格涨到 ${stop_price:,.0f} 时平仓 (亏损约 {stop_price/r['bid'] - 1:.1f}x 权利金)")
+        # R3-3: 建议张数
+        try:
+            from position_sizer import suggest_qty
+            from binance_options import get_account_equity, BinanceOptionsAPI
+            _api = BinanceOptionsAPI()
+            _acct = get_account_equity(_api)
+            if _acct["source"] != "error":
+                _sizing = suggest_qty(
+                    account_equity=_acct["equity"],
+                    current_used_margin=_acct["initial_margin"],
+                    per_contract_margin=margin_est,
+                    existing_expiry_notional=0,
+                    strike=r['strike'],
+                )
+                print(f"  建议张数: {_sizing['qty']} ({_sizing['reason']})")
+            else:
+                print(f"  建议张数: N/A (未配置 API key)")
+        except Exception:
+            print(f"  建议张数: N/A")
 
     print(f"\n  ----")
     print(f"  组合总评分: {sum(p['total_score'] for p in picks) / len(picks):.1f}")
