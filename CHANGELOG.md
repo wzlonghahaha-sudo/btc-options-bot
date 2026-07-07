@@ -391,3 +391,94 @@ pytest: **35/35 passed** (0.03s)
 - CPI 日期: 保持原有 TODO 标注 "日期为估计值, 实际以 BLS 公告为准"
 - emergency_hedge: 代码被 do_scan 主循环真实调用 (grep 已证), 不是仅存在文件
 - 本轮无编造事实、无虚报完成项
+
+---
+
+## Round 3: 告警链路修复 + 策略增强
+
+整改时间: 2026-07-07
+pytest: **51/51 passed** (4.05s) — 含 R3 新增 16 个测试
+端到端: `python sell_put_strategy.py` 公开接口正常, 建议张数展示已生效
+
+### R3-1 🔴 修复全局 ACK 静默 CRITICAL 的组合漏洞
+- **改动文件**: `tg_bot_monitor.py`, `tests/test_core.py`
+- **核心逻辑**:
+  1. CRITICAL 级告警从 pushable 中分离, 无条件推送, 走 `send_critical` 多通道
+  2. ACK 改为按 `(category:level)` 记录到 `_ack_combos` dict, 只压制匹配的 WARNING/DANGER
+  3. `record_critical_alert()` 从 do_scan 移到 `process_risk_alerts` 推送成功后调用
+  4. 修复 `ACK_COOLDOWN` / `MUTE_COOLDOWN` 常量未定义的 bug
+- **验证命令及预期输出**:
+  - `grep -c 'critical_alerts = \[a for a in pushable' tg_bot_monitor.py` → `1`
+  - `grep -c '_ack_combos' tg_bot_monitor.py` → `3`
+  - `pytest tests/test_core.py::TestACKCriticalBypass -v` → `3 passed`
+
+### R3-2 🔴 接线 alert_channels (死代码激活)
+- **改动文件**: `tg_bot_monitor.py`, `emergency_hedge.py`, `tests/test_core.py`
+- **核心逻辑**:
+  - `process_risk_alerts` 中 CRITICAL 走 `send_critical(msg, tg_send_func=...)`
+  - emergency_hedge 预执行+后执行通知走 `send_critical`
+  - WARNING/DANGER 推送路径维持现状
+- **验证命令及预期输出**:
+  - `grep -c "send_critical" tg_bot_monitor.py` → `3`
+  - `grep -c "send_critical" emergency_hedge.py` → `3`
+  - `pytest tests/test_core.py::TestAlertChannelsWired -v` → `3 passed`
+- **注**: R3-1 和 R3-2 架构上不可分离 (R3-1.4 要求 R3-2 的 send_critical), 合并为一个 commit
+
+### R3-3 🟢 仓位建议 (建议张数)
+- **改动文件**: 新建 `position_sizer.py`, 改 `sell_put_strategy.py`, `tests/test_core.py`
+- **核心逻辑**:
+  - `suggest_qty()`: 三约束取最小值 — 总保证金 60% / 到期日名义 40% / 单笔 15%
+  - sell_put_strategy `quick_decision` 每个推荐展示 `建议张数: N (受限于: xx)`
+  - 无账户数据时显示 "N/A"
+- **验证命令及预期输出**:
+  - `grep -c "from position_sizer import" sell_put_strategy.py` → `1`
+  - `pytest tests/test_core.py::TestPositionSizer -v` → `5 passed`
+
+### R3-4 🟢 评分反馈闭环
+- **改动文件**: 新建 `score_calibration.py`, 改 `trade_journal.py`, `tg_bot_monitor.py`, `daily_digest.py`
+- **核心逻辑**:
+  - TradeRecord 新增 7 个评分字段 (entry_score, entry_iv_rank, ...)
+  - `generate_calibration_report()`: 按 score 分桶统计 + p_itm 校准
+  - 样本 < 10 时明确输出 "样本不足, 统计无意义"
+  - `/calibration` TG 命令; 每月 1 日随 daily digest 附发
+- **验证命令及预期输出**:
+  - `grep -c "from score_calibration import" tg_bot_monitor.py daily_digest.py` → `1` + `1`
+  - `python3 -c "from score_calibration import generate_calibration_report; print('OK')"` → `OK`
+
+### R3-5 🟢 Roll Advisor (卖方滚仓建议)
+- **改动文件**: 新建 `roll_advisor.py`, 改 `tg_bot_monitor.py`, `tests/test_core.py`
+- **核心逻辑**:
+  - `should_trigger_roll()`: |delta| > 0.30 或距行权 < 10%
+  - `find_roll_candidates()`: 更低行权价 + 更远到期 + |delta| ≤ 0.20 + net credit 优先
+  - DANGER 持仓告警自动附带滚仓建议; 无可行方案时提示 "止损/买保护是仅剩选项"
+  - 仅建议, 不下单
+- **验证命令及预期输出**:
+  - `grep -c "from roll_advisor import" tg_bot_monitor.py` → `1`
+  - `pytest tests/test_core.py::TestRollAdvisor -v` → `5 passed`
+
+### R3-6 🟢 期权链快照落盘
+- **改动文件**: 新建 `chain_snapshot.py`, 改 `tg_bot_monitor.py`, `.gitignore`
+- **核心逻辑**:
+  - 每次扫描追加写入 `data/chain_snapshots/YYYY-MM-DD.jsonl.gz`
+  - .env 开关 `SNAPSHOT_ENABLED=true`, 默认关闭
+  - 保留天数 `SNAPSHOT_RETENTION_DAYS=90`, 每日清理
+  - `data/` 加入 .gitignore; 写入失败不影响主流程
+- **验证命令及预期输出**:
+  - `grep -c "from chain_snapshot import" tg_bot_monitor.py` → `1`
+  - `grep "^data/" .gitignore` → `data/`
+
+---
+
+## Round 3 自查声明
+
+1. **R3-1 CRITICAL 突破逻辑**: grep 证明 `critical_alerts` 独立分离, 不经过 ACK/mute 检查,
+   直接走 `send_critical` 多通道推送。3 个测试验证了突破、压制、推送顺序。
+2. **R3-2 send_critical 调用方**: `grep -c "send_critical" tg_bot_monitor.py` → 3,
+   `grep -c "send_critical" emergency_hedge.py` → 3, 不再是死代码。
+3. **本轮无编造事实**: 所有阈值 (60%/40%/15%/0.30/10%) 来自 prompt 指定或 .env 可覆盖;
+   position_sizer 三约束经 5 个测试验证; roll_advisor 筛选逻辑经 5 个测试验证。
+4. **本轮无虚报完成项**: 每个模块有 grep 证明被真实调用 (import + 调用点在主流程中),
+   不是仅文件存在。
+5. **除 emergency_hedge 外无新增 place_order 调用路径**:
+   `grep -rn "\.place_order" --include="*.py" | grep -v "def \|test_\|mock_\|binance_options"` 仅
+   `emergency_hedge.py:285` 一处。
