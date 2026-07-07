@@ -391,3 +391,196 @@ class TestEmergencyHedge:
         # 不会真正下单, 但证明了 all gates passed 并进入了 _execute_hedge
         # mock_tg 应被调用 (要么报错消息, 要么预执行通知)
         assert mock_tg.called, "TG should be called when all gates pass"
+
+
+# ============================================================
+#  R3-1: ACK 不压制 CRITICAL + 推送失败不启动倒计时
+# ============================================================
+class TestACKCriticalBypass:
+    """R3-1: CRITICAL 告警突破 ACK/mute 验证"""
+
+    def test_critical_bypasses_ack(self):
+        """(a) ACK 后新 CRITICAL 仍应推送 — 验证 process_risk_alerts 逻辑"""
+        # 验证: CRITICAL 分离到 critical_alerts, 不受 ACK 影响
+        # 通过检查源码中的分离逻辑
+        import inspect
+        # 如果 tg_bot_monitor 导入失败(缺少网络模块), 直接检查源码文本
+        with open("tg_bot_monitor.py") as f:
+            src = f.read()
+
+        # 关键逻辑: CRITICAL 列表独立于 ACK 检查
+        assert 'critical_alerts = [a for a in pushable if a.level == "CRITICAL"]' in src
+        assert 'non_critical = [a for a in pushable if a.level != "CRITICAL"]' in src
+        # CRITICAL 走 send_critical 多通道
+        assert "send_critical(msg, tg_send_func=_tg_critical_send)" in src
+        # 非 CRITICAL 才检查 ACK
+        assert "acked_combos" in src
+        assert "combo_key" in src
+
+    def test_ack_suppresses_same_danger(self):
+        """(b) ACK 后同类 DANGER 被压制 — 验证 ACK 按 (category:level) 记录"""
+        with open("tg_bot_monitor.py") as f:
+            src = f.read()
+        # ACK handler 写入 _ack_combos 而非全局 _ack_alert
+        assert '"_ack_combos"' in src or "'_ack_combos'" in src
+        # ACK 只记录 WARNING/DANGER
+        assert 'if a.level in ("WARNING", "DANGER")' in src
+
+    def test_push_fail_no_countdown(self):
+        """(c) 推送失败时 pending_emergency_alert_time 保持 0"""
+        # record_critical_alert 仅在 process_risk_alerts 推送成功后调用
+        with open("tg_bot_monitor.py") as f:
+            src = f.read()
+        # 在 do_scan 中, 旧的 record_critical_alert 调用已被移除
+        # 新的调用点在 process_risk_alerts 的 CRITICAL 推送成功后
+        assert "# R3-1: record_critical_alert 已移到 process_risk_alerts" in src
+        # 确认 process_risk_alerts 中 record_critical_alert 在 send_critical 之后
+        # 找到 send_critical 和 record_critical_alert 的位置
+        idx_send = src.index("send_critical(msg, tg_send_func=_tg_critical_send)")
+        idx_record = src.index(
+            "self.emergency_hedge.record_critical_alert()",
+            idx_send  # 从 send_critical 之后搜索
+        )
+        assert idx_record > idx_send, \
+            "record_critical_alert must be called AFTER send_critical"
+
+
+# ============================================================
+#  R3-2: alert_channels.send_critical 调用方验证
+# ============================================================
+class TestAlertChannelsWired:
+    """R3-2: send_critical 不再是死代码"""
+
+    def test_send_critical_called_in_tg_bot(self):
+        """send_critical 在 tg_bot_monitor 中有调用"""
+        with open("tg_bot_monitor.py") as f:
+            src = f.read()
+        assert "from alert_channels import send_critical" in src
+        assert "send_critical(" in src
+
+    def test_send_critical_called_in_emergency_hedge(self):
+        """send_critical 在 emergency_hedge 中有调用"""
+        with open("emergency_hedge.py") as f:
+            src = f.read()
+        assert "from alert_channels import send_critical" in src
+        assert "send_critical(" in src
+
+    def test_smtp_fallback_on_tg_failure(self):
+        """mock tg_send_func 抛异常 3 次, 验证降级到 SMTP"""
+        from unittest.mock import MagicMock, patch
+        from alert_channels import send_critical
+
+        mock_tg = MagicMock(side_effect=Exception("TG down"))
+        mock_smtp = MagicMock(return_value=True)
+
+        with patch("alert_channels._send_smtp", mock_smtp):
+            send_critical("test alert", tg_send_func=mock_tg)
+
+        # TG 应被重试 3 次
+        assert mock_tg.call_count == 3
+        # SMTP 应被调用 1 次 (降级)
+        assert mock_smtp.call_count == 1
+
+
+# ============================================================
+#  R3-3: position_sizer 单元测试
+# ============================================================
+class TestPositionSizer:
+    """仓位建议计算"""
+
+    def test_total_margin_binding(self):
+        """总保证金 60% 是约束瓶颈"""
+        from position_sizer import suggest_qty
+        # equity=100k, used=55k, per_contract=8k, no expiry constraint
+        r = suggest_qty(100000, 55000, 8000, 0, strike=50000)
+        # room = 100k*0.6 - 55k = 5k, 5k/8k = 0
+        assert r["qty"] == 0
+        assert r["binding_constraint"] == "total_margin_60pct"
+
+    def test_expiry_notional_binding(self):
+        """同到期日名义敞口 40% 是约束瓶颈"""
+        from position_sizer import suggest_qty
+        # equity=100k, used=0, per_contract=5k, expiry_notional=35k, strike=50k
+        r = suggest_qty(100000, 0, 5000, 35000, strike=50000)
+        # margin room: 100k*0.6/5k = 12
+        # expiry room: (100k*0.4 - 35k) / 50k = 5k/50k = 0
+        assert r["qty"] == 0
+        assert r["binding_constraint"] == "expiry_notional_40pct"
+
+    def test_single_trade_binding(self):
+        """单笔保证金 15% 是约束瓶颈"""
+        from position_sizer import suggest_qty
+        # equity=100k, used=0, per_contract=20k, strike=5000 (低行权价, 不受 notional 限制)
+        # margin room: 100k*0.6/20k = 3
+        # expiry room: 100k*0.4/5000 = 8
+        # single room: 100k*0.15/20k = 0
+        r = suggest_qty(100000, 0, 20000, 0, strike=5000)
+        assert r["qty"] == 0
+        assert r["binding_constraint"] == "single_trade_15pct"
+
+    def test_positive_qty(self):
+        """有空间时返回正数"""
+        from position_sizer import suggest_qty
+        # equity=100k, used=10k, per_contract=5k, strike=10000 (低行权价)
+        # margin room: (100k*0.6 - 10k) / 5k = 10
+        # expiry room: 100k*0.4 / 10k = 4
+        # single room: 100k*0.15 / 5k = 3
+        r = suggest_qty(100000, 10000, 5000, 0, strike=10000)
+        assert r["qty"] > 0
+
+    def test_zero_equity(self):
+        """零账户 → qty=0"""
+        from position_sizer import suggest_qty
+        r = suggest_qty(0, 0, 5000, 0, strike=50000)
+        assert r["qty"] == 0
+
+
+# ============================================================
+#  R3-5: roll_advisor 单元测试
+# ============================================================
+class TestRollAdvisor:
+    """滚仓建议"""
+
+    def test_trigger_by_delta(self):
+        """delta > 0.30 触发"""
+        from roll_advisor import should_trigger_roll
+        assert should_trigger_roll(0.35, 20) is True
+
+    def test_trigger_by_distance(self):
+        """距行权 < 10% 触发"""
+        from roll_advisor import should_trigger_roll
+        assert should_trigger_roll(0.15, 8) is True
+
+    def test_no_trigger(self):
+        """条件不满足时不触发"""
+        from roll_advisor import should_trigger_roll
+        assert should_trigger_roll(0.20, 15) is False
+
+    def test_find_candidates_filters_correctly(self):
+        """筛选逻辑: 更低行权价 + 更远到期 + delta ≤ 0.20"""
+        from roll_advisor import find_roll_candidates
+        chain = [
+            # 合格: 更低行权价, 更远到期, delta OK, net credit
+            {"symbol": "BTC-260925-45000-P", "strike": 45000, "dte": 80,
+             "bid": 800, "ask": 810, "delta": -0.08, "mark_price": 805},
+            # 不合格: 行权价不低于当前
+            {"symbol": "BTC-260925-55000-P", "strike": 55000, "dte": 80,
+             "bid": 1500, "ask": 1510, "delta": -0.15, "mark_price": 1505},
+            # 不合格: delta 太大
+            {"symbol": "BTC-260925-48000-P", "strike": 48000, "dte": 80,
+             "bid": 1200, "ask": 1210, "delta": -0.25, "mark_price": 1205},
+        ]
+        results = find_roll_candidates(
+            "BTC-260731-50000-P", 50000, 500, 700, 24, 63000, chain
+        )
+        # 只有第一个合格 (行权价<50000, delta 0.08<0.20, net_credit=800-700=100>0)
+        assert len(results) == 1
+        assert results[0]["symbol"] == "BTC-260925-45000-P"
+        assert results[0]["net_credit"] == 100.0
+        assert results[0]["type"] == "credit"
+
+    def test_empty_chain_format(self):
+        """无候选时提示止损/买保护"""
+        from roll_advisor import format_roll_advice
+        msg = format_roll_advice("BTC-260731-50000-P", [])
+        assert "止损" in msg

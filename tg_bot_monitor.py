@@ -91,6 +91,8 @@ SIGNAL_COOLDOWN = 3600           # 同一信号1小时去重
 SIGNAL_UPGRADE_COOLDOWN = 60     # 信号升级60秒去重
 POS_WARN_COOLDOWN = 1800         # 持仓WARNING 30分钟
 POS_DANGER_COOLDOWN = 300        # 持仓DANGER 5分钟
+ACK_COOLDOWN = 86400             # ACK 确认后静默 24 小时
+MUTE_COOLDOWN = 3600             # 手动静音 1 小时
 
 # ============================================================
 #  可调参数白名单 (P2-3)
@@ -655,6 +657,7 @@ class MessageFormatter:
             "/ai - 🤖 AI 策略分析 (Claude)\n"
             "/payoff - 📈 组合到期 Payoff 图\n"
             "/hedge - 🛡️ 对冲方案计算\n"
+            "/calibration - 📊 评分校准报告\n"
             "/perf - 📊 策略绩效统计\n"
             "/journal - 📝 最近交易记录\n"
             "/config - ⚙️ 查看可调参数\n"
@@ -1084,13 +1087,8 @@ class MonitorService:
                     log.info(f"对冲止盈提醒: {ea['short_sym']} ({ea['reason']})")
 
             # 应急自动对冲: 检查是否需要触发
-            # 先检查是否有 CRITICAL 强平告警 → 启动 ACK 倒计时
-            has_critical_margin = any(
-                a.level == "CRITICAL" and a.category == "MARGIN"
-                for a in risk_alerts
-            )
-            if has_critical_margin:
-                self.emergency_hedge.record_critical_alert()
+            # R3-1: record_critical_alert 已移到 process_risk_alerts 推送成功后调用
+            # 这里只调用 check_and_act (disabled 时纯 no-op)
 
             # 调用应急对冲评估 (disabled 时纯 no-op)
             self.emergency_hedge.check_and_act(
@@ -1153,6 +1151,16 @@ class MonitorService:
             self.state.save_iv_surface_snapshot(iv_surface, data["timestamp"])
         except Exception as e:
             log.warning(f"保存 IV 曲面快照失败: {e}")
+
+        # R3-6: 期权链快照落盘 (为回测积累数据)
+        try:
+            from chain_snapshot import save_chain_snapshot, cleanup_old_snapshots
+            save_chain_snapshot(data)
+            # 每天第一次扫描时清理过期文件
+            if self.scan_count <= 1:
+                cleanup_old_snapshots()
+        except Exception as e:
+            log.warning(f"期权链快照失败 (不影响主流程): {e}")
 
         # P0-1: 交易日志 — 检测持仓变化
         try:
@@ -1241,9 +1249,33 @@ class MonitorService:
                     self.tg.broadcast(msg, silent=True)
                 self.cooldown.record_pos_alert(sym, alert)
                 log.info(f"推送持仓预警: {sym} [{alert}]")
+                # R3-5: DANGER/CRITICAL 持仓附带滚仓建议
+                if alert == "DANGER" and self.last_result:
+                    try:
+                        from roll_advisor import should_trigger_roll, find_roll_candidates, format_roll_advice
+                        abs_delta = abs(p.get("delta", 0))
+                        dist = p.get("dist_to_strike", 100)
+                        if should_trigger_roll(abs_delta, dist):
+                            chain = self._get_hedge_candidates(self.last_result["data"])
+                            strike = p.get("strike", 0)
+                            entry = p.get("entry", 0)
+                            mark = p.get("mark", 0)
+                            dte = p.get("dte", 30)
+                            spot = self.last_result["data"]["spot"]
+                            candidates = find_roll_candidates(
+                                sym, strike, entry, mark, dte, spot, chain)
+                            roll_msg = format_roll_advice(sym, candidates)
+                            self.tg.broadcast(roll_msg, silent=True)
+                    except Exception as e:
+                        log.warning(f"滚仓建议生成失败 [{sym}]: {e}")
 
     def process_risk_alerts(self, risk_alerts: list):
-        """处理风控告警推送"""
+        """处理风控告警推送
+
+        R3-1 修复: CRITICAL 级告警永远突破 ACK/mute, 无条件推送。
+        ACK 按 (category, level) 记录, 只压制匹配的组合。
+        record_critical_alert 在推送成功后调用, 保证"倒计时 ⇒ 用户已被通知"。
+        """
         pushable = [a for a in risk_alerts
                     if a.level in ("WARNING", "DANGER", "CRITICAL")
                     and self.risk_engine.should_push(a)]
@@ -1251,28 +1283,55 @@ class MonitorService:
         if not pushable:
             return
 
-        # 检查是否被用户静音/确认
+        # --- 分离 CRITICAL 和非 CRITICAL ---
+        critical_alerts = [a for a in pushable if a.level == "CRITICAL"]
+        non_critical = [a for a in pushable if a.level != "CRITICAL"]
+
+        # --- 非 CRITICAL: 受 ACK/mute 压制 ---
         now = time.time()
-        ack_until = self.cooldown.signal_sent.get("_ack_alert", {}).get("time", 0)
+        acked_combos = self.cooldown.signal_sent.get("_ack_combos", {})
         mute_until = self.cooldown.signal_sent.get("_mute_1h", {}).get("time", 0)
-        if now < ack_until or now < mute_until:
-            log.info(f"告警已被用户静音, 跳过推送 ({len(pushable)} 项)")
-            return
 
-        msg = format_risk_alerts(pushable)
-        # CRITICAL 不静默
-        silent = all(a.level == "WARNING" for a in pushable)
+        allowed_non_critical = []
+        for a in non_critical:
+            combo_key = f"{a.category}:{a.level}"
+            ack_until = acked_combos.get(combo_key, 0)
+            if now < ack_until:
+                log.info(f"告警 [{combo_key}] 已被 ACK, 跳过")
+                continue
+            if now < mute_until:
+                log.info(f"告警 [{combo_key}] 已被静音, 跳过")
+                continue
+            allowed_non_critical.append(a)
 
-        has_critical_or_danger = any(
-            a.level in ("CRITICAL", "DANGER") for a in pushable)
-        if has_critical_or_danger:
-            self.tg.broadcast_with_buttons(msg, ALERT_ACK_BUTTONS, silent=silent)
-        else:
-            self.tg.broadcast(msg, silent=silent)
-        log.info(f"推送风控告警: {len(pushable)} 项 "
-                 f"(C:{len([a for a in pushable if a.level=='CRITICAL'])} "
-                 f"D:{len([a for a in pushable if a.level=='DANGER'])} "
-                 f"W:{len([a for a in pushable if a.level=='WARNING'])})")
+        # --- 推送非 CRITICAL (如果有) ---
+        if allowed_non_critical:
+            msg = format_risk_alerts(allowed_non_critical)
+            silent = all(a.level == "WARNING" for a in allowed_non_critical)
+            has_danger = any(a.level == "DANGER" for a in allowed_non_critical)
+            if has_danger:
+                self.tg.broadcast_with_buttons(msg, ALERT_ACK_BUTTONS, silent=silent)
+            else:
+                self.tg.broadcast(msg, silent=silent)
+            log.info(f"推送风控告警 (非CRITICAL): {len(allowed_non_critical)} 项")
+
+        # --- CRITICAL: 无条件推送, 走多通道 (R3-2) ---
+        if critical_alerts:
+            from alert_channels import send_critical
+            msg = format_risk_alerts(critical_alerts)
+
+            def _tg_critical_send(text):
+                """封装 broadcast_with_buttons, 供 send_critical 使用"""
+                self.tg.broadcast_with_buttons(text, ALERT_ACK_BUTTONS)
+
+            send_critical(msg, tg_send_func=_tg_critical_send)
+            log.info(f"推送 CRITICAL 告警 (突破 ACK/mute): {len(critical_alerts)} 项")
+
+            # R3-1.3: 推送成功后才启动 ACK 倒计时
+            has_critical_margin = any(
+                a.category == "MARGIN" for a in critical_alerts)
+            if has_critical_margin:
+                self.emergency_hedge.record_critical_alert()
 
     def process_v2_signals(self, result: dict):
         """处理 v2 机会扫描的信号推送
@@ -1493,14 +1552,20 @@ class MonitorService:
 
                 now = time.time()
                 if callback_data == "ack_alert":
-                    # 确认告警: 24小时内不再推送
-                    self.cooldown.signal_sent["_ack_alert"] = {
-                        "signal": "ACK", "time": now + ACK_COOLDOWN
-                    }
+                    # R3-1: ACK 按类别+级别记录, 只压制匹配的组合
+                    # 获取最近推送的 pushable 告警的 (category, level) 集合
+                    acked_combos = self.cooldown.signal_sent.get("_ack_combos", {})
+                    if self.last_result:
+                        recent_alerts = self.last_result.get("risk_alerts", [])
+                        for a in recent_alerts:
+                            if a.level in ("WARNING", "DANGER"):
+                                combo_key = f"{a.category}:{a.level}"
+                                acked_combos[combo_key] = now + ACK_COOLDOWN
+                    self.cooldown.signal_sent["_ack_combos"] = acked_combos
                     # 通知应急对冲模块: 用户已确认, 取消自动对冲
                     self.emergency_hedge.record_ack()
-                    self.tg.send("✅ 告警已确认, 24小时内不再重复推送")
-                    log.info("用户确认告警, 静默24h")
+                    self.tg.send("✅ 告警已确认, 同类 WARNING/DANGER 24h 内不再推送\n(CRITICAL 不受影响)")
+                    log.info("用户确认告警 (按类别+级别 ACK)")
                 elif callback_data == "mute_1h":
                     # 静音1小时
                     self.cooldown.signal_sent["_mute_1h"] = {
@@ -1866,6 +1931,15 @@ class MonitorService:
                         self.tg.send(f"❌ Payoff 图生成失败: {e}")
                 else:
                     self.tg.send("⏳ 尚未完成首次扫描")
+
+            elif text == "/calibration":
+                try:
+                    from score_calibration import generate_calibration_report
+                    report = generate_calibration_report(self.journal.data)
+                    self.tg.send(report)
+                except Exception as e:
+                    log.error(f"校准报告生成失败: {e}")
+                    self.tg.send(f"❌ 校准报告生成失败: {e}")
 
             elif text == "/perf":
                 msg = self.journal.format_performance_tg()

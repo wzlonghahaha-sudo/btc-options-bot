@@ -246,7 +246,7 @@ class EmergencyHedge:
             cost = best_put["cost"]
             short_sym = symbol.split("BTC-")[-1]
 
-            # 2. 预执行 TG 通知
+            # 2. 预执行 TG 通知 (R3-2: 走多通道, 这条消息绝不允许丢)
             pre_msg = (
                 "🚨🤖 <b>[应急对冲] 即将自动执行</b>\n\n"
                 f"动作: <b>BUY Long Put</b>\n"
@@ -257,7 +257,8 @@ class EmergencyHedge:
                 f"触发原因: 强平告警超时 {self.ack_timeout} 分钟无人确认\n"
                 f"BTC 现价: ${spot:,.0f}"
             )
-            self._tg_send_safe(pre_msg)
+            from alert_channels import send_critical
+            send_critical(pre_msg, tg_send_func=self.tg_send)
             log.error(
                 "[AUDIT] About to BUY %s x%.1f @ $%.0f (cost=$%.0f)",
                 symbol, qty, ask_price, cost,
@@ -298,7 +299,7 @@ class EmergencyHedge:
             self.emergency_acked = False
             self._save_state()
 
-            # 7. 后执行 TG 通知
+            # 7. 后执行 TG 通知 (R3-2: 走多通道)
             post_msg = (
                 "🚨🤖 <b>[应急对冲] 已执行!</b>\n\n"
                 f"订单号: <code>{order_id}</code>\n"
@@ -309,7 +310,7 @@ class EmergencyHedge:
                 f"下次自动对冲最早: 24小时后\n"
                 f"⚠️ 请尽快检查持仓!"
             )
-            self._tg_send_safe(post_msg)
+            send_critical(post_msg, tg_send_func=self.tg_send)
             log.error(
                 "[AUDIT] Order executed: orderId=%s status=%s "
                 "symbol=%s qty=%.1f price=%.0f cost=%.0f",
