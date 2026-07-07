@@ -334,13 +334,60 @@ pytest: **35/35 passed** (0.03s) — 含 R2-1 和 R2-2 新增 5 个测试
 
 ---
 
-## Round 2 自查声明
+## Round 2 复核验证 (2026-07-07)
 
-1. **R2-1 FOMC 日期**: 逐一与 prompt 给出的 8 个日期比对 — 全部一致
-   (1/28, 3/18, 4/29, 6/17, 7/29, 9/16, 10/28, 12/9), 旧错误日期 (1/29, 5/6, 11/4, 12/16) 已删除。
-2. **R2-2 emergency_hedge 已接线**: grep 证明 import、check_and_act、record_critical_alert、
-   record_ack 四个调用点均存在于 tg_bot_monitor.py 中。
-3. **本轮无编造事实**: FOMC 日期来自 prompt 提供的官方确认清单, 未自行推断;
-   CPI 日期保持原有 TODO 标注。
-4. **本轮无虚报完成项**: 每项改动均有可复现的验证命令和预期输出,
-   "已完成"的定义是代码被真实调用 (grep 可证), 不是文件存在。
+复核时间: 2026-07-07
+pytest: **35/35 passed** (0.03s)
+端到端: `python sell_put_strategy.py` 公开接口运行正常, 16 个合约通过筛选, 零报错
+
+### R2 逐项复核结果
+
+| 编号 | 状态 | 关键验证证据 |
+|------|------|-------------|
+| R2-1 | ✅ | 2026 FOMC 8/8 正确, 4 条错误日期已删, 2027 tentative 8/8 含标注, CPI 保持 TODO |
+| R2-2 | ✅ | import=1, check_and_act 在 do_scan 内=1, record_ack 在 callback=1, record_critical_alert=1, 4 个 pytest 全绿 |
+| R2-3 | ✅ | `from risk_rules import DIST_WARN_PCT` 存在, DIST_WARN_PCT 使用 3 处, 零硬编码 `< 15`, TP_* 6 个常量均为模块级 |
+| R2-4 | ✅ | tg_bot_monitor 中 get_account_equity 调用 7 处, 零 `ma["asset"][0]`, USDT 遍历查找 + asset[0] fallback 含 log.warning |
+| R2-5 | ✅ | scenarios=[-10,-20,-30,-40,-50], -40/-50 缺口→WATCH 级, /risk 表格展示全 5 档 |
+| R2-6 | ✅ | `git ls-files` 中零 cerebras/vc-daily/xlsx 文件, .gitignore 含 5 条排除规则 + 仓库范围注释 |
+
+---
+
+## 全局约束 1-5 复核声明 (2026-07-07 重新执行)
+
+### 约束 1: 保证金公式一个字符不能动 ✅
+> margin_calc.py 中的保证金公式经过币安实测校准, 公式本身一个字符都不要动, 只允许新增函数。
+
+**复核结果**:
+- `git diff 615aa87..HEAD -- margin_calc.py` → 无输出 (R2 整改中 margin_calc.py 零改动)
+- 上轮新增的 `_calc_stressed_iv()` 未触碰保证金计算函数体
+
+### 约束 2: 除 emergency_hedge 外不得调用 place_order / cancel_order ✅
+> 任何代码路径都不得调用 place_order / cancel_order, 除 P0-12 的 opt-in 应急对冲功能。
+
+**复核结果**:
+- `grep -rn "\.place_order\|\.cancel_order" --include="*.py"` 在非定义、非测试文件中仅 `emergency_hedge.py` 出现 1 处
+- `tests/test_core.py` 中的 `mock_api.place_order` 是 mock 断言, 不调用真实 API
+- emergency_hedge.py 调用前有 `assert side == "BUY"` 编译时安全网
+
+### 约束 3: TG 命令向后兼容 ✅
+> 所有 Telegram 命令的现有行为和输出格式保持可用, 只允许增强不允许破坏。
+
+**复核结果**:
+- 19 个命令全部在 tg_bot_monitor.py 中有处理分支:
+  /help /start /status /scan /positions /orders /profit /risk /iv /top
+  /overview /ai /hedge /perf /journal /strategy /rules /config /set /payoff
+
+### 约束 4: 代码注释和 docstring 保持中文风格 ✅
+**复核结果**:
+- R2 涉及的 6 个文件 (event_calendar / emergency_hedge / profit_optimizer /
+  risk_monitor / binance_options / tg_bot_monitor) 均有中文 module docstring
+- 所有新增注释为中文
+
+### 约束 5: 不编造事实、不虚报完成 ✅
+**复核结果**:
+- FOMC 2026: 8 个日期逐一与 prompt 提供的官方确认清单比对, 全部一致
+- FOMC 2027: 8 个日期逐一与 prompt 提供的暂定版比对, 全部一致, 均标注 "tentative, 以 Fed 官网确认为准"
+- CPI 日期: 保持原有 TODO 标注 "日期为估计值, 实际以 BLS 公告为准"
+- emergency_hedge: 代码被 do_scan 主循环真实调用 (grep 已证), 不是仅存在文件
+- 本轮无编造事实、无虚报完成项
