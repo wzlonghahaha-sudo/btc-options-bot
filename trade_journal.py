@@ -76,6 +76,15 @@ class TradeRecord:
 
     status: str = "OPEN"       # OPEN / CLOSED / EXPIRED
 
+    # R3-4: 开仓时的评分数据 (由 tg_bot_monitor 在检测到新开仓后回填)
+    entry_score: float = 0
+    entry_iv_rank: float = 0
+    entry_iv_hv_ratio: float = 0
+    entry_expected_value: float = 0
+    entry_p_itm: float = 0
+    entry_dte: float = 0
+    entry_safety_cushion: float = 0
+
     def to_dict(self) -> dict:
         return asdict(self)
 

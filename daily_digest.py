@@ -329,4 +329,17 @@ def generate_daily_digest(api, risk_engine, state_persistence) -> str:
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("<i>每日自动推送 · /help 查看命令</i>")
 
+    # R3-4: 每月 1 日附发评分校准报告
+    try:
+        if now_utc.day == 1:
+            from score_calibration import generate_calibration_report
+            from trade_journal import TradeJournal
+            journal = TradeJournal()
+            cal_report = generate_calibration_report(journal.data)
+            lines.append("")
+            lines.append("━" * 35)
+            lines.append(cal_report)
+    except Exception as e:
+        log.warning(f"评分校准报告生成失败: {e}")
+
     return "\n".join(lines)
