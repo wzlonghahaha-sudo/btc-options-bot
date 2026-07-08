@@ -452,7 +452,7 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
             from event_calendar import score_penalty_for_events
             from datetime import date as _date
             ev_penalty, event_descs = score_penalty_for_events(
-                _date.today(), expiry_date.date() if hasattr(expiry_date, 'date') else expiry_date)
+                _date.today(), expiry.date() if hasattr(expiry, 'date') else expiry)
             score += ev_penalty
         except Exception as e:
             log.warning(f"事件日历评分失败 [{sym}]: {e}")
