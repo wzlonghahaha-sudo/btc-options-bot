@@ -2324,6 +2324,8 @@ class MonitorService:
 
         sig.signal(sig.SIGINT, handle_exit)
         sig.signal(sig.SIGTERM, handle_exit)
+        # 忽略 SIGHUP: 终端关闭时不要退出 (等同于 nohup)
+        sig.signal(sig.SIGHUP, sig.SIG_IGN)
 
         # 启动命令监听线程 (daemon=True: 主线程退出时自动结束)
         cmd_thread = threading.Thread(target=self._command_loop, daemon=True)
