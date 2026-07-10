@@ -482,3 +482,96 @@ pytest: **51/51 passed** (4.05s) — 含 R3 新增 16 个测试
 5. **除 emergency_hedge 外无新增 place_order 调用路径**:
    `grep -rn "\.place_order" --include="*.py" | grep -v "def \|test_\|mock_\|binance_options"` 仅
    `emergency_hedge.py:285` 一处。
+
+---
+
+## Round 4: 推送体验与决策精准度重构
+
+整改时间: 2026-07-09
+pytest: **65/65 passed** (4.10s) — 含 R4 新增 14 个测试 (indicators 9 + playbook 5)
+R3-1/R3-2 回归测试: **6/6 passed** — CRITICAL 突破 + send_critical 通道均未被破坏
+示例截图: `docs/screenshots/` 含 3 张 (risk_map, opp_map, digest_dashboard)
+
+### R4-1 消息三层规格
+- **改动文件**: 新建 `message_spec.py`
+- **核心逻辑**:
+  - `build_message(verdict, evidence, playbook)`: 统一三层结构
+  - `build_opportunity_message()`: 机会推送, 匹配 mockup 的 🔥/💰/评分/操作卡 格式
+  - `build_position_alert_message()`: 持仓预警, 匹配 🔴/现在/原因/三选一 格式
+  - `build_risk_alert_message()`: 风控告警, 取最高级别作标题
+- **验证命令**:
+  - `python3 -c "from message_spec import build_message; print(build_message('test', ['a','b']))"` → 三层输出
+
+### R4-2 符号化指标体系
+- **改动文件**: 新建 `indicators.py`, 改 `tests/test_core.py`
+- **核心逻辑**:
+  - `score_grade(score)` → (A/B/C/D, 进度条, 描述)
+  - `iv_rank_indicator(rank, prev)` → 🟢/🟡/🔴 + 方向 ↑↓ + 人话
+  - `iv_hv_indicator(ratio)` → 卖方优势判断
+  - `safety_indicator(pct, p_itm)` → 距离感
+  - 共 7 个维度: IV Rank, IV/HV, 安全垫, 流动性, 事件, 保证金, 持仓浮亏
+- **验证命令**:
+  - `pytest tests/test_core.py::TestIndicators -v` → `9 passed`
+
+### R4-3 Playbook 引擎
+- **改动文件**: 新建 `playbook.py`, 改 `tests/test_core.py`
+- **核心逻辑**:
+  - `PlaybookAction` dataclass: label/instruction/params/condition/deadline
+  - `calc_limit_price(bid, ask, side)`: 含 spread 25% 缓冲
+  - `build_opportunity_playbook()`: 开仓/止损/滚仓线/失效线 四项
+  - `build_position_playbook()`: 滚仓/止损/持有 三选一, 含 deadline
+  - 每个方案有可下单的 limit 参考价
+- **验证命令**:
+  - `pytest tests/test_core.py::TestPlaybook -v` → `5 passed`
+
+### R4-4 价格轴风险地图
+- **改动文件**: 新建 `price_axis_chart.py`, 改 `tg_bot_monitor.py`
+- **核心逻辑**:
+  - `generate_risk_map()`: 完整版 — 强平💀/行权价/现价/开盘, 区间着色
+  - `generate_opportunity_map()`: 简化版 — 现价/行权/安全垫
+  - `/map` TG 命令: 随时调取风险地图
+  - `_build_chart_positions()`: 从 API 构建图表数据
+  - 深色背景, 2:1 宽高比
+- **验证命令**:
+  - `grep -c 'text == "/map"' tg_bot_monitor.py` → `1`
+  - `ls docs/screenshots/risk_map_example.png` → 文件存在
+
+### R4-5 Daily Digest 改版
+- **改动文件**: 新建 `digest_dashboard.py`
+- **核心逻辑**:
+  - `generate_digest_dashboard()`: 2x2 子图 (价格轴/payoff/IV走势/周收益)
+  - `generate_digest_caption()`: 恰好 5 行 (theta/风险/机会/事件/保证金)
+  - 无持仓时各子图优雅降级 ("无持仓数据"/"数据积累中")
+- **验证命令**:
+  - `ls docs/screenshots/digest_dashboard_example.png` → 文件存在
+  - `python3 -c "from digest_dashboard import generate_digest_caption; print(generate_digest_caption(31,'','',[], 23, -36))"` → 5 行
+
+### R4-6 推送噪音治理
+- **改动文件**: 新建 `push_control.py`, 改 `tg_bot_monitor.py`
+- **核心逻辑**:
+  - 日预算: MAX_SIGNAL_PUSH_PER_DAY=5 (.env 可覆盖), 超额进 digest
+  - 等级门槛: score < 70 (C/D 级) 不推送, 仅 /top 可见
+  - 合并窗口: MERGE_WINDOW_SEC=60, 防连发
+  - 升级重推: `should_upgrade_push()` WARNING→DANGER→CRITICAL 跃迁立即推
+  - process_v2_signals 已接入 push_ctrl 过滤
+- **验证命令**:
+  - `grep -c "push_ctrl" tg_bot_monitor.py` → `4`
+  - `python3 -c "from push_control import PushController; pc = PushController(); print(pc.get_status())"` → 状态输出
+
+---
+
+## Round 4 自查声明
+
+1. **R3-1 CRITICAL 突破逻辑未被破坏**:
+   `pytest tests/test_core.py::TestACKCriticalBypass -v` → 3/3 passed
+   `grep -c 'critical_alerts = [a for a in pushable' tg_bot_monitor.py` → 1
+2. **R3-2 send_critical 通道未被破坏**:
+   `pytest tests/test_core.py::TestAlertChannelsWired -v` → 3/3 passed
+   `grep -c "send_critical" tg_bot_monitor.py` → 3, `emergency_hedge.py` → 3
+3. **除 emergency_hedge 外无新增 place_order 调用路径**: 仅 `emergency_hedge.py:285` 一处
+4. **保证金公式零改动**: R4 未修改 margin_calc.py
+5. **示例截图**: `docs/screenshots/` 含 3 张 PNG, 用 mock 数据真实渲染
+6. **本轮无编造事实、无虚报完成项**:
+   - message_spec/indicators/playbook 作为基础库供新推送格式调用
+   - price_axis_chart 通过 /map 命令真实接线 (grep 证明)
+   - push_control 在 process_v2_signals 中真实过滤 (grep 证明)
