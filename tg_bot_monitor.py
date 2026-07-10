@@ -658,6 +658,7 @@ class MessageFormatter:
             "/payoff - 📈 组合到期 Payoff 图\n"
             "/hedge - 🛡️ 对冲方案计算\n"
             "/calibration - 📊 评分校准报告\n"
+            "/map - 🗺 价格轴风险地图\n"
             "/perf - 📊 策略绩效统计\n"
             "/journal - 📝 最近交易记录\n"
             "/config - ⚙️ 查看可调参数\n"
@@ -879,6 +880,10 @@ class MonitorService:
         self.state = StatePersistence()
         self.hedge_advisor = HedgeAdvisor()
         self.risk_mode = RiskMode()
+
+        # R4-6: 推送噪音控制
+        from push_control import PushController
+        self.push_ctrl = PushController()
 
         # 应急自动对冲 (opt-in, 默认关闭)
         from emergency_hedge import EmergencyHedge
@@ -1358,6 +1363,11 @@ class MonitorService:
         if not top_opps:
             return
 
+        # R4-6: 推送预算 + 等级门槛
+        top_opps = [o for o in top_opps if self.push_ctrl.should_push_signal(o.score)]
+        if not top_opps:
+            return
+
         # 去重: 1小时内同一合约不重复推送
         new_top = []
         for o in top_opps:
@@ -1392,7 +1402,9 @@ class MonitorService:
         msg = format_signal_push(opps, account)
         if msg:
             self.tg.broadcast(msg)
-            log.info(f"推送 v2 信号: {len(new_top)} 个 (78+分)")
+            for _ in new_top:
+                self.push_ctrl.record_signal_push()
+            log.info(f"推送 v2 信号: {len(new_top)} 个 (A/B级)")
 
     def process_profit_advice(self, profit_analysis: dict):
         """处理止盈/Roll建议推送"""
@@ -1932,6 +1944,23 @@ class MonitorService:
                 else:
                     self.tg.send("⏳ 尚未完成首次扫描")
 
+            elif text == "/map":
+                try:
+                    from price_axis_chart import generate_risk_map
+                    positions_data = self._build_chart_positions()
+                    liq = self.hedge_advisor.get_last_liquidation()
+                    liq_price = liq.get("liq_price", 0) if liq else 0
+                    daily_open = self.risk_engine.price_tracker.daily_open or 0
+                    chart_path = generate_risk_map(
+                        self.last_spot, daily_open, positions_data, liq_price)
+                    if chart_path:
+                        self.tg.send_photo(chart_path, caption="🗺 价格轴风险地图")
+                    else:
+                        self.tg.send("❌ 风险地图生成失败 (无持仓数据)")
+                except Exception as e:
+                    log.error(f"风险地图失败: {e}")
+                    self.tg.send(f"❌ 风险地图生成失败: {e}")
+
             elif text == "/calibration":
                 try:
                     from score_calibration import generate_calibration_report
@@ -2145,6 +2174,38 @@ class MonitorService:
             log.error(f"获取对冲候选失败: {e}")
 
         return candidates
+
+    def _build_chart_positions(self) -> list:
+        """构建 price_axis_chart 需要的持仓数据格式"""
+        positions_data = []
+        try:
+            positions = self.api.get_position()
+            marks = self.last_result.get("data", {}).get("marks", {}) if self.last_result else {}
+            spot = self.last_spot
+            for p in positions:
+                qty = float(p.get("quantity", 0))
+                if qty == 0:
+                    continue
+                sym = p.get("symbol", "")
+                strike = float(p.get("strikePrice", 0))
+                entry = float(p.get("entryPrice", 0))
+                mark_price = float(p.get("markPrice", 0))
+                m = marks.get(sym, {})
+                if mark_price <= 0:
+                    mark_price = float(m.get("markPrice", 0))
+                direction = "Short" if qty < 0 else "Long"
+                if qty < 0:
+                    pnl = (entry - mark_price) * abs(qty)
+                else:
+                    pnl = (mark_price - entry) * abs(qty)
+                positions_data.append({
+                    "symbol": sym, "strike": strike, "qty": qty,
+                    "entry": entry, "mark": mark_price,
+                    "pnl": round(pnl, 2), "direction": direction,
+                })
+        except Exception as e:
+            log.warning(f"构建持仓图表数据失败: {e}")
+        return positions_data
 
     def _check_proactive_roll(self, result: dict):
         """P2-8: 到期前主动 Roll 提醒"""
