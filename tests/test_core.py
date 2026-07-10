@@ -584,3 +584,113 @@ class TestRollAdvisor:
         from roll_advisor import format_roll_advice
         msg = format_roll_advice("BTC-260731-50000-P", [])
         assert "止损" in msg
+
+
+# ============================================================
+#  R4-2: indicators 等级映射测试
+# ============================================================
+class TestIndicators:
+    """符号化指标体系"""
+
+    def test_score_grade_A(self):
+        from indicators import score_grade
+        g, bar, desc = score_grade(85)
+        assert g == "A"
+        assert "▰▰▰▰" in bar
+
+    def test_score_grade_B(self):
+        from indicators import score_grade
+        g, bar, desc = score_grade(75)
+        assert g == "B"
+
+    def test_score_grade_C(self):
+        from indicators import score_grade
+        g, bar, desc = score_grade(65)
+        assert g == "C"
+
+    def test_score_grade_D(self):
+        from indicators import score_grade
+        g, bar, desc = score_grade(50)
+        assert g == "D"
+
+    def test_iv_rank_high(self):
+        from indicators import iv_rank_indicator
+        s = iv_rank_indicator(80, prev_rank=65)
+        assert "🟢" in s
+        assert "↑" in s
+        assert "65" in s
+
+    def test_iv_hv_strong(self):
+        from indicators import iv_hv_indicator
+        s = iv_hv_indicator(1.5)
+        assert "🟢" in s
+        assert "明确" in s
+
+    def test_iv_hv_weak(self):
+        from indicators import iv_hv_indicator
+        s = iv_hv_indicator(0.8)
+        assert "🔴" in s
+
+    def test_safety_green(self):
+        from indicators import safety_indicator
+        s = safety_indicator(22.0, 5.5)
+        assert "🟢" in s
+
+    def test_safety_red(self):
+        from indicators import safety_indicator
+        s = safety_indicator(8.0, 25.0)
+        assert "🔴" in s
+
+
+# ============================================================
+#  R4-3: playbook 测试
+# ============================================================
+class TestPlaybook:
+    """操作卡引擎"""
+
+    def test_opportunity_playbook_has_all_fields(self):
+        from playbook import build_opportunity_playbook
+        pb = build_opportunity_playbook(
+            "BTC-260828-52000-P", qty=3, bid=300, ask=310,
+            entry_price=300, stop_price=750,
+            spot=63000, strike=52000, safety_pct=17.5)
+        assert "SELL" in pb
+        assert "止损" in pb
+        assert "滚仓" in pb or "roll" in pb.lower()
+        assert "失效" in pb
+
+    def test_position_playbook_with_roll(self):
+        """浮亏可滚: 3 个动作"""
+        from playbook import build_position_playbook
+        roll = [{"symbol": "BTC-260925-50000-P", "net_credit": 50,
+                 "new_safety_pct": 20, "type": "credit"}]
+        pb = build_position_playbook(
+            "BTC-260731-56000-P", qty=-1.7, entry=597, mark=900,
+            bid=895, ask=910, spot=58000, strike=56000,
+            dist_pct=3.4, loss_ratio=1.5, roll_candidates=roll)
+        assert "滚仓" in pb
+        assert "买回" in pb or "止损" in pb
+        assert "持有" in pb
+        assert "⏰" in pb  # deadline
+
+    def test_position_playbook_no_roll(self):
+        """浮亏不可滚: 2 个动作"""
+        from playbook import build_position_playbook
+        pb = build_position_playbook(
+            "BTC-260731-56000-P", qty=-1.7, entry=597, mark=900,
+            bid=895, ask=910, spot=57000, strike=56000,
+            dist_pct=1.8, loss_ratio=2.0, roll_candidates=None)
+        assert "滚仓" not in pb
+        assert "买回" in pb or "止损" in pb
+        assert "持有" in pb
+
+    def test_limit_price_buy(self):
+        from playbook import calc_limit_price
+        # bid=100, ask=110, spread=10, buffer=2.5
+        lp = calc_limit_price(100, 110, "BUY")
+        assert lp > 110  # ask + buffer
+
+    def test_limit_price_sell(self):
+        from playbook import calc_limit_price
+        lp = calc_limit_price(100, 110, "SELL")
+        assert lp < 100  # bid - buffer
