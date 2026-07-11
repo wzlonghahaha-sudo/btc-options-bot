@@ -1226,9 +1226,10 @@ class MonitorService:
                 self.cooldown.record_signal(r["symbol"], r["signal"])
 
         if to_send:
+            # R4: 三层格式 (V1 信号仍用旧格式, 因为 V2 是主推送通道)
             msg = self.fmt.signal_alert(to_send, spot)
             self.tg.broadcast(msg)
-            log.info(f"推送 {len(to_send)} 个信号")
+            log.info(f"推送 {len(to_send)} 个 V1 信号")
 
     def process_pos_alerts(self, pos_alerts: list):
         """处理持仓预警"""
@@ -1247,32 +1248,71 @@ class MonitorService:
                 if alert == "DANGER" and (now < ack_until or now < mute_until):
                     log.info(f"持仓预警 {sym} [{alert}] 被用户静音, 跳过")
                     continue
-                msg = self.fmt.position_alert(p)
+                # R4 接线: 三层格式持仓预警 + 操作卡 + 风险地图
+                try:
+                    from indicators import pnl_indicator, dist_strike_indicator
+                    from message_spec import build_position_alert_message
+                    from playbook import build_position_playbook
+
+                    entry_p = p.get("entry", 0)
+                    mark_p = p.get("mark", 0)
+                    pnl_val = p.get("pnl", 0)
+                    dist_val = p.get("dist_to_strike", 100)
+                    loss_r = (mark_p - entry_p) / entry_p if entry_p > 0 else 0
+                    qty_val = p.get("qty", 0)
+                    strike_val = p.get("strike", 0)
+                    bid_val = mark_p * 0.98  # 近似 bid
+                    ask_val = mark_p * 1.02  # 近似 ask
+                    spot_val = self.last_spot
+
+                    pnl_line = f"浮亏 ${abs(pnl_val):,.0f} ({loss_r:.1f}x权利金) · 距行权仅 {dist_val:.1f}%"
+                    cause_line = p.get("msg", "BTC 走势变化")
+
+                    ev = [pnl_indicator(pnl_val, loss_r, entry_p),
+                          dist_strike_indicator(dist_val)]
+
+                    # 滚仓候选
+                    roll_candidates = None
+                    if alert == "DANGER" and self.last_result:
+                        try:
+                            from roll_advisor import should_trigger_roll, find_roll_candidates
+                            abs_delta = abs(p.get("delta", 0))
+                            if should_trigger_roll(abs_delta, dist_val):
+                                chain = self._get_hedge_candidates(self.last_result["data"])
+                                dte = p.get("dte", 30)
+                                roll_candidates = find_roll_candidates(
+                                    sym, strike_val, entry_p, mark_p, dte, spot_val, chain)
+                        except Exception as e:
+                            log.warning(f"滚仓搜索失败: {e}")
+
+                    pb = build_position_playbook(
+                        sym, qty_val, entry_p, mark_p, bid_val, ask_val,
+                        spot_val, strike_val, dist_val, loss_r, roll_candidates)
+
+                    msg = build_position_alert_message(
+                        sym, alert, pnl_line, cause_line, ev, pb)
+                except Exception as e:
+                    log.warning(f"R4格式持仓预警失败, 降级旧格式: {e}")
+                    msg = self.fmt.position_alert(p)
+
                 if alert == "DANGER":
                     self.tg.broadcast_with_buttons(msg, ALERT_ACK_BUTTONS)
+                    # DANGER 附带风险地图
+                    try:
+                        from price_axis_chart import generate_risk_map
+                        positions_data = self._build_chart_positions()
+                        liq = self.hedge_advisor.get_last_liquidation()
+                        liq_price = liq.get("liq_price", 0) if liq else 0
+                        daily_open = self.risk_engine.price_tracker.daily_open or 0
+                        chart = generate_risk_map(self.last_spot, daily_open, positions_data, liq_price)
+                        if chart:
+                            self.tg.broadcast_photo(chart)
+                    except Exception as e:
+                        log.warning(f"风险地图附图失败: {e}")
                 else:
                     self.tg.broadcast(msg, silent=True)
                 self.cooldown.record_pos_alert(sym, alert)
-                log.info(f"推送持仓预警: {sym} [{alert}]")
-                # R3-5: DANGER/CRITICAL 持仓附带滚仓建议
-                if alert == "DANGER" and self.last_result:
-                    try:
-                        from roll_advisor import should_trigger_roll, find_roll_candidates, format_roll_advice
-                        abs_delta = abs(p.get("delta", 0))
-                        dist = p.get("dist_to_strike", 100)
-                        if should_trigger_roll(abs_delta, dist):
-                            chain = self._get_hedge_candidates(self.last_result["data"])
-                            strike = p.get("strike", 0)
-                            entry = p.get("entry", 0)
-                            mark = p.get("mark", 0)
-                            dte = p.get("dte", 30)
-                            spot = self.last_result["data"]["spot"]
-                            candidates = find_roll_candidates(
-                                sym, strike, entry, mark, dte, spot, chain)
-                            roll_msg = format_roll_advice(sym, candidates)
-                            self.tg.broadcast(roll_msg, silent=True)
-                    except Exception as e:
-                        log.warning(f"滚仓建议生成失败 [{sym}]: {e}")
+                log.info(f"推送持仓预警 (R4格式): {sym} [{alert}]")
 
     def process_risk_alerts(self, risk_alerts: list):
         """处理风控告警推送
@@ -1311,7 +1351,15 @@ class MonitorService:
 
         # --- 推送非 CRITICAL (如果有) ---
         if allowed_non_critical:
-            msg = format_risk_alerts(allowed_non_critical)
+            # R4 接线: 三层格式风控告警
+            try:
+                from message_spec import build_risk_alert_message
+                from playbook import build_risk_playbook
+                pb = build_risk_playbook(allowed_non_critical, self.last_spot)
+                msg = build_risk_alert_message(allowed_non_critical, pb)
+            except Exception as e:
+                log.warning(f"R4格式风控告警失败, 降级旧格式: {e}")
+                msg = format_risk_alerts(allowed_non_critical)
             silent = all(a.level == "WARNING" for a in allowed_non_critical)
             has_danger = any(a.level == "DANGER" for a in allowed_non_critical)
             if has_danger:
@@ -1323,7 +1371,14 @@ class MonitorService:
         # --- CRITICAL: 无条件推送, 走多通道 (R3-2) ---
         if critical_alerts:
             from alert_channels import send_critical
-            msg = format_risk_alerts(critical_alerts)
+            try:
+                from message_spec import build_risk_alert_message
+                from playbook import build_risk_playbook
+                pb = build_risk_playbook(critical_alerts, self.last_spot)
+                msg = build_risk_alert_message(critical_alerts, pb)
+            except Exception as e:
+                log.warning(f"R4格式CRITICAL告警失败, 降级旧格式: {e}")
+                msg = format_risk_alerts(critical_alerts)
 
             def _tg_critical_send(text):
                 """封装 broadcast_with_buttons, 供 send_critical 使用"""
@@ -1399,12 +1454,62 @@ class MonitorService:
             except Exception as e:
                 log.warning(f"信号记录到交易日志失败 [{o.symbol}]: {e}")
 
-        msg = format_signal_push(opps, account)
-        if msg:
-            self.tg.broadcast(msg)
-            for _ in new_top:
+        # R4 接线: 用三层格式替代旧 format_signal_push
+        for o in new_top:
+            try:
+                from indicators import score_grade, iv_rank_indicator, iv_hv_indicator, safety_indicator, event_indicator
+                from message_spec import build_opportunity_message
+                from playbook import build_opportunity_playbook, calc_limit_price
+                from risk_rules import get_stop_loss_price
+                from position_sizer import suggest_qty
+
+                grade, bar, _ = score_grade(o.score)
+                # 建议张数
+                qty = 1
+                margin_pct_after = o.new_margin_usage
+                try:
+                    from binance_options import get_account_equity
+                    _acct = get_account_equity(self.api)
+                    if _acct["source"] != "error":
+                        sizing = suggest_qty(_acct["equity"], _acct["initial_margin"],
+                                            o.margin_required, 0, o.strike)
+                        qty = max(sizing["qty"], 1)
+                except Exception:
+                    pass
+
+                limit_price = calc_limit_price(o.bid, o.ask, "SELL")
+                mid = (o.bid + o.ask) / 2
+                stop_price = get_stop_loss_price(o.bid)
+
+                ev_lines = []
+                ev_lines.append(iv_rank_indicator(50))  # TODO: 传入真实 IV Rank
+                ev_lines.append(iv_hv_indicator(o.iv_hv_ratio))
+                ev_lines.append(safety_indicator(o.safety_pct, abs(o.delta) * 100))
+                evt_ind = event_indicator(o.cons)
+                if evt_ind:
+                    ev_lines.append(evt_ind)
+
+                pb = build_opportunity_playbook(
+                    o.symbol, qty, o.bid, o.ask, o.bid, stop_price,
+                    self.last_spot, o.strike, o.safety_pct)
+
+                msg = build_opportunity_message(
+                    symbol=o.symbol, score=o.score, grade=grade, bar=bar,
+                    qty=qty, limit_price=limit_price, bid=o.bid, mid=mid,
+                    total_premium=o.bid * qty, margin_per=o.margin_required,
+                    margin_pct_after=margin_pct_after,
+                    evidence_lines=ev_lines, playbook_text=pb)
+
+                self.tg.broadcast(msg)
                 self.push_ctrl.record_signal_push()
-            log.info(f"推送 v2 信号: {len(new_top)} 个 (A/B级)")
+                log.info(f"推送 v2 信号 (R4格式): {o.symbol} score={o.score:.0f} grade={grade}")
+            except Exception as e:
+                log.warning(f"R4格式推送失败 [{o.symbol}], 降级旧格式: {e}")
+                # 降级: 用旧格式
+                fallback = format_signal_push([o], account)
+                if fallback:
+                    self.tg.broadcast(fallback)
+                    self.push_ctrl.record_signal_push()
 
     def process_profit_advice(self, profit_analysis: dict):
         """处理止盈/Roll建议推送"""
@@ -2337,9 +2442,41 @@ class MonitorService:
                     if (now_utc.hour == DAILY_DIGEST_HOUR_UTC
                             and self.last_digest_date != today_str):
                         log.info("触发每日 Digest 推送")
-                        digest_msg = generate_daily_digest(
-                            self.api, self.risk_engine, self.state)
-                        self.tg.broadcast(digest_msg, silent=True)
+                        # R4-5: 尝试发送仪表盘 PNG + 5 行 caption
+                        try:
+                            from digest_dashboard import generate_digest_dashboard, generate_digest_caption
+                            positions_data = self._build_chart_positions()
+                            liq = self.hedge_advisor.get_last_liquidation()
+                            liq_price = liq.get("liq_price", 0) if liq else 0
+                            liq_drop = liq.get("liq_drop_pct", -50) if liq else -50
+                            daily_open = self.risk_engine.price_tracker.daily_open or 0
+                            iv_history = self.state.get_iv_surface_history(hours=168)
+                            journal_data = self.journal.data
+                            dashboard_path = generate_digest_dashboard(
+                                self.last_spot, daily_open, positions_data,
+                                liq_price, iv_history, journal_data)
+                            # 5 行 caption
+                            theta_est = sum(abs(p.get("pnl", 0)) * 0.02 for p in positions_data if p.get("direction") == "Short")
+                            from binance_options import get_account_equity
+                            acct = get_account_equity(self.api)
+                            margin_pct = acct.get("initial_margin", 0) / acct.get("equity", 1) * 100 if acct.get("equity", 0) > 0 else 0
+                            caption = generate_digest_caption(
+                                theta_daily=theta_est,
+                                top_alert_verdict="",
+                                top_opp_verdict="",
+                                events_7d=[],
+                                margin_usage_pct=margin_pct,
+                                liq_drop_pct=liq_drop)
+                            if dashboard_path:
+                                self.tg.broadcast_photo(dashboard_path, caption=caption)
+                                log.info("每日 Digest 仪表盘已推送")
+                            else:
+                                raise Exception("仪表盘生成失败")
+                        except Exception as e:
+                            log.warning(f"仪表盘生成失败, 降级文字版: {e}")
+                            digest_msg = generate_daily_digest(
+                                self.api, self.risk_engine, self.state)
+                            self.tg.broadcast(digest_msg, silent=True)
                         self.last_digest_date = today_str
                         log.info("每日 Digest 已推送")
                 except Exception as e:
