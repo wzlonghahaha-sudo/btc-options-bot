@@ -135,11 +135,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg_bot")
 
-# 告警确认按钮
-ALERT_ACK_BUTTONS = [
-    {"text": "已处理 ✅", "callback_data": "ack_alert"},
-    {"text": "静音1h 🔇", "callback_data": "mute_1h"},
-]
+# 告警确认按钮 (语义拆分: 已处理 vs 稍后)
+from ux_copy import alert_action_buttons, opportunity_action_buttons
+ALERT_ACK_BUTTONS = alert_action_buttons()
+
+VALID_BOT_MODES = ("hunt", "hold", "quiet")
 
 
 # ============================================================
@@ -304,14 +304,18 @@ class TelegramBot:
 
     def send_with_buttons(self, chat_id: str, text: str, buttons: list,
                           parse_mode: str = "HTML") -> bool:
-        """发送带 inline keyboard 按钮的消息"""
+        """发送带 inline keyboard 按钮的消息 (默认每行 2 个)"""
         try:
-            reply_markup = {
-                "inline_keyboard": [
-                    [{"text": btn["text"], "callback_data": btn["callback_data"]}
-                     for btn in buttons]
-                ]
-            }
+            if buttons and isinstance(buttons[0], list):
+                rows = buttons
+            else:
+                rows = []
+                for i in range(0, len(buttons), 2):
+                    rows.append([
+                        {"text": b["text"], "callback_data": b["callback_data"]}
+                        for b in buttons[i:i + 2]
+                    ])
+            reply_markup = {"inline_keyboard": rows}
             resp = self.session.post(
                 f"{self.api_base}/sendMessage",
                 json={
@@ -329,7 +333,6 @@ class TelegramBot:
         except Exception as e:
             log.error(f"TG send_with_buttons error: {e}")
             return False
-
     def broadcast_with_buttons(self, text: str, buttons: list,
                                 parse_mode: str = "HTML", silent: bool = False):
         """广播带按钮的消息: 发到主 chat + 所有群组"""
@@ -626,183 +629,26 @@ class MessageFormatter:
 
     @staticmethod
     def status_msg(spot: float, scan_count: int, uptime_str: str,
-                   last_scan_time: float, interval: int) -> str:
-        """格式化 /status 响应"""
-        now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-        return (
-            f"🤖 <b>Bot 状态</b>  {now}\n\n"
-            f"BTC: ${spot:,.2f}\n"
-            f"扫描次数: {scan_count}\n"
-            f"运行时间: {uptime_str}\n"
-            f"上次扫描: {last_scan_time:.1f}s\n"
-            f"扫描间隔: {interval}s"
-        )
+                   last_scan_time: float, interval: int,
+                   push_status: dict = None, mode: str = "hunt") -> str:
+        from ux_copy import status_msg as _status
+        return _status(spot, scan_count, uptime_str, last_scan_time,
+                       interval, push_status, mode)
 
     @staticmethod
-    def help_msg() -> str:
-        return (
-            "🤖 <b>BTC OTM Put 监控 Bot</b>\n\n"
-            "<b>可用命令:</b>\n"
-            "/status - 查看 Bot 运行状态\n"
-            "/scan - 立即执行一次扫描\n"
-            "/positions - 查看当前持仓\n"
-            "/orders - 查看挂单 & 成交差距\n"
-            "/profit - 💰 止盈/Roll/HV分析\n"
-            "/risk - 🛡️ 风控报告\n"
-            "/iv - 查看 IV 曲面\n"
-            "/top - 🔍 全部机会 (三档分层+风控)\n"
-            "/top80 - 🔥 仅看80+高分机会\n"
-            "/top70 - ⭐ 看70+以上机会\n"
-            "/overview - 发送完整市场概览\n"
-            "/ai - 🤖 AI 策略分析 (Claude)\n"
-            "/payoff - 📈 组合到期 Payoff 图\n"
-            "/hedge - 🛡️ 对冲方案计算\n"
-            "/calibration - 📊 评分校准报告\n"
-            "/map - 🗺 价格轴风险地图\n"
-            "/perf - 📊 策略绩效统计\n"
-            "/journal - 📝 最近交易记录\n"
-            "/config - ⚙️ 查看可调参数\n"
-            "/set - ⚙️ 修改参数 (如 /set scan_interval 120)\n"
-            "/strategy - 📖 策略说明 (小白版)\n"
-            "/rules - 📏 具体入场/风控规则\n"
-            "/help - 显示此帮助\n\n"
-            "<b>自动推送:</b>\n"
-            "• 80+高分机会: 即时详情推送 (1h去重)\n"
-            "• 55-79普通机会: 轻量提示 (4h去重)\n"
-            "• 持仓预警: 即时推送\n"
-            "• 市场概览 + AI分析: 每4小时\n"
-            "• 扫描间隔: 常规3分钟, 波动时1分钟"
-        )
+    def help_msg(mode: str = "hunt") -> str:
+        from ux_copy import help_msg as _help
+        return _help(mode)
 
     @staticmethod
     def strategy_msg() -> str:
-        return (
-            "📖 <b>策略说明 (小白版)</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-            "<b>一句话总结:</b>\n"
-            "我们卖「BTC 崩盘保险」给别人，收保险费赚钱。\n\n"
-
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>🎯 在做什么？</b>\n\n"
-            "我们卖的是 BTC 的「看跌期权」(Put)。\n\n"
-            "打个比方：\n"
-            "BTC 现在 $78,000，我们卖一份合约说：\n"
-            "「如果 BTC 跌到 $50,000 以下，我赔你钱」\n\n"
-            "买家付给我们 $300 保险费（权利金）。\n"
-            "如果到期时 BTC 没跌到 $50,000 → 我们白赚 $300 ✅\n"
-            "如果真跌到了 → 我们要赔钱 ❌\n\n"
-
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>🤔 为什么能赚钱？</b>\n\n"
-            "1️⃣ <b>概率站在我们这边</b>\n"
-            "我们选的行权价离现价很远 (跌25-50%才亏)\n"
-            "BTC 在1-2个月内跌这么多的概率很低\n\n"
-            "2️⃣ <b>时间是我们的朋友</b>\n"
-            "每过一天，期权就贬值一点 (Theta衰减)\n"
-            "我们什么都不用做，保险费自动到手\n\n"
-            "3️⃣ <b>我们只在「贵」的时候卖</b>\n"
-            "市场恐慌时保险费会暴涨 (IV飙升)\n"
-            "平时值 $100 的保险，恐慌时能卖 $500\n"
-            "我们专门等这个时候出手 → 赔率极高\n\n"
-
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>⏰ 什么时候出手？</b>\n\n"
-            "不急！等三个条件同时满足：\n\n"
-            "🟢 <b>安全垫够大</b>\n"
-            "BTC 至少要跌 25%+ 我们才亏钱\n\n"
-            "🟢 <b>保险费够贵</b> (IV溢价高)\n"
-            "别人恐慌时愿意付更多钱买保险\n"
-            "IV 溢价至少比正常贵 15% 以上\n\n"
-            "🟢 <b>赔率划算</b>\n"
-            "综合评分达到 75 分以上才推送信号\n"
-            "达到 88 分是「强信号」— 极罕见但极好\n\n"
-
-            "大部分时间 Bot 都是安静的 🤫\n"
-            "安静 = 没有好机会 = 不出手 = 正确！\n\n"
-
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>⚠️ 风险在哪？</b>\n\n"
-            "最大风险：BTC 突然暴跌超过预期\n"
-            "比如：行权价 $50,000，BTC 跌到 $30,000\n"
-            "我们每张合约亏 $20,000\n\n"
-            "所以风控非常重要：\n"
-            "• 浮亏达到 1x 权利金 → ⚠️ 警告\n"
-            "• 浮亏达到 2x 权利金 → 🔴 建议平仓\n"
-            "• BTC 距行权价 &lt;12% → 🔴 紧急\n"
-            "• Bot 会自动推送这些预警\n\n"
-
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>📊 Bot 在做什么？</b>\n\n"
-            "每 3 分钟扫描一次所有 BTC Put 期权：\n"
-            "• 计算每个合约的「赔率」\n"
-            "• 监控 IV 水平 (保险费贵不贵)\n"
-            "• 盯着你的持仓盈亏\n"
-            "• 发现好机会 → 推送给你\n"
-            "• 持仓有风险 → 推送预警\n\n"
-            "输入 /rules 查看具体的入场和风控数字"
-        )
+        from ux_copy import strategy_msg as _strategy
+        return _strategy()
 
     @staticmethod
     def rules_msg() -> str:
-        return (
-            "📏 <b>入场规则 & 风控标准</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-            "<b>🔍 合约筛选 (硬门槛)</b>\n"
-            "不满足任一条直接淘汰：\n\n"
-            "• Delta: |δ| ≤ 0.05 (极深度虚值)\n"
-            "• 虚值程度: OTM ≥ 25%\n"
-            "  → BTC至少跌25%才到行权价\n"
-            "• 到期天数: 14 ~ 90 天\n"
-            "  → 太短gamma大，太长占资金\n"
-            "• 最低Bid: ≥ $50\n"
-            "  → 权利金太薄不值得\n"
-            "• Spread: ≤ 10%\n"
-            "  → 必须能以合理价格成交\n"
-            "• 安全垫: ≥ 25%\n"
-            "  → BTC跌到盈亏平衡点的距离\n"
-            "• IV溢价: ≥ 15%\n"
-            "  → 期权定价必须偏贵\n\n"
-
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>📊 评分模型 (Sinclair风险溢价框架)</b>\n\n"
-            "核心理念: Edge来自variance premium\n"
-            "(IV&gt;HV), 不是theta衰减\n\n"
-            "五个维度加权打分：\n"
-            "• 安全垫 (30%权重) — 活下来\n"
-            "  距行权价的安全距离\n"
-            "• 风险溢价 (30%权重) — Edge来源\n"
-            "  IV溢价(60%) + IV/HV比值(40%)\n"
-            "  期权越贵、IV越高于HV, 分越高\n"
-            "• 年化收益 (20%权重) — 回报合理性\n"
-            "  10%起步, 30%不错, 60%+满分\n"
-            "• 流动性 (10%权重) — 能成交\n"
-            "  Spread+成交量\n"
-            "• 时间结构 (10%权重) — 资金效率\n"
-            "  14-45天甜蜜区 + theta效率\n\n"
-
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>🚦 信号等级</b>\n\n"
-            "• ⚪ WAIT (&lt;55分) → 不推送, 继续等\n"
-            "• 👀 WATCH (55-79分) → 轻量提示 (4h一次)\n"
-            "  └ /top 查看详情\n"
-            "• 🔥 STRONG (80分+) → <b>完整详情推送</b> (1h去重)\n"
-            "• 🔥🔥 ELITE (90分+) → <b>极强信号推送</b>\n\n"
-            "大部分时间都是安静的\n"
-            "80+机会可能几天出现一次\n"
-            "90+极强信号非常罕见\n\n"
-
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>🛡️ 持仓风控</b>\n\n"
-            "• 浮亏 ≥ 1x 权利金 → ⚠️ 警告推送\n"
-            "• 浮亏 ≥ 2x 权利金 → 🔴 建议止损\n"
-            "• 距行权价 &lt; 18% → ⚠️ 警告\n"
-            "• 距行权价 &lt; 12% → 🔴 紧急平仓\n"
-            "• BTC日跌 &gt; 2% → 自动加快扫描到1分钟\n"
-            "• BTC日跌 &gt; 4% → 🔴 紧急通知"
-        )
-
+        from ux_copy import rules_msg as _rules
+        return _rules()
 
 # ============================================================
 #  去重管理器
@@ -906,9 +752,17 @@ class MonitorService:
         self.update_offset = 0
         self.last_digest_date = None  # 每日 digest 去重: 记录上次发送日期
 
+        # UX: 机会推送可操作上下文 {short_sym: {symbol, qty, limit, bid, score, ts}}
+        self.pending_opp_actions: dict = {}
+        # 首次扫描开始时间 (用于冷启动文案)
+        self.first_scan_started_at = 0
+
         # P1-4: 恢复持久化状态
         self._restore_state()
 
+    def get_bot_mode(self) -> str:
+        mode = get_runtime_param("bot_mode", "hunt")
+        return mode if mode in VALID_BOT_MODES else "hunt"
     def _restore_state(self):
         """从持久化文件恢复运行时状态"""
         try:
@@ -1328,6 +1182,12 @@ class MonitorService:
         if not pushable:
             return
 
+        # quiet 模式: 仅 CRITICAL
+        if self.get_bot_mode() == "quiet":
+            pushable = [a for a in pushable if a.level == "CRITICAL"]
+            if not pushable:
+                return
+
         # --- 分离 CRITICAL 和非 CRITICAL ---
         critical_alerts = [a for a in pushable if a.level == "CRITICAL"]
         non_critical = [a for a in pushable if a.level != "CRITICAL"]
@@ -1397,13 +1257,15 @@ class MonitorService:
         """处理 v2 机会扫描的信号推送
 
         推送策略:
-        - 78+分: 主动推送完整详情
-        - <78分: 不推送, 用户通过 /top 自行查看
+        - SCORE_PUSH+分: 主动推送完整详情
+        - 低于门槛: 不推送, 用户通过 /top 自行查看
         - 去重: 1小时内同一合约不重复推送
-        - 危机模式下抑制: 不推送新开仓信号
+        - hold/quiet 模式抑制新开仓信号
         """
-        # 危机模式: 不推送新开仓信号
+        # 危机模式 / 持仓防守 / 安静模式: 不推送新开仓信号
         if self.risk_mode.should_suppress_signals:
+            return
+        if self.get_bot_mode() in ("hold", "quiet"):
             return
 
         opps = result.get("v2_opportunities", [])
@@ -1413,8 +1275,9 @@ class MonitorService:
 
         now = time.time()
 
-        # 只关注78+机会
-        top_opps = [o for o in opps if o.score >= ScanConfig.SCORE_PUSH and o.can_open]
+        # 只关注推送门槛以上的可开仓机会
+        push_score = get_runtime_param("score_push", ScanConfig.SCORE_PUSH)
+        top_opps = [o for o in opps if o.score >= push_score and o.can_open]
         if not top_opps:
             return
 
@@ -1454,7 +1317,7 @@ class MonitorService:
             except Exception as e:
                 log.warning(f"信号记录到交易日志失败 [{o.symbol}]: {e}")
 
-        # R4 接线: 用三层格式替代旧 format_signal_push
+        # R4 接线: 用三层格式 + 可操作按钮
         for o in new_top:
             try:
                 from indicators import score_grade, iv_rank_indicator, iv_hv_indicator, safety_indicator, event_indicator
@@ -1500,9 +1363,19 @@ class MonitorService:
                     margin_pct_after=margin_pct_after,
                     evidence_lines=ev_lines, playbook_text=pb)
 
-                self.tg.broadcast(msg)
+                short_sym = o.symbol.split("BTC-")[-1]
+                self.pending_opp_actions[short_sym] = {
+                    "symbol": o.symbol,
+                    "qty": qty,
+                    "limit": limit_price,
+                    "bid": o.bid,
+                    "score": o.score,
+                    "ts": now,
+                }
+                self.tg.broadcast_with_buttons(
+                    msg, opportunity_action_buttons(short_sym))
                 self.push_ctrl.record_signal_push()
-                log.info(f"推送 v2 信号 (R4格式): {o.symbol} score={o.score:.0f} grade={grade}")
+                log.info(f"推送 v2 信号 (R4+按钮): {o.symbol} score={o.score:.0f} grade={grade}")
             except Exception as e:
                 log.warning(f"R4格式推送失败 [{o.symbol}], 降级旧格式: {e}")
                 # 降级: 用旧格式
@@ -1681,15 +1554,59 @@ class MonitorService:
                     self.cooldown.signal_sent["_ack_combos"] = acked_combos
                     # 通知应急对冲模块: 用户已确认, 取消自动对冲
                     self.emergency_hedge.record_ack()
-                    self.tg.send("✅ 告警已确认, 同类 WARNING/DANGER 24h 内不再推送\n(CRITICAL 不受影响)")
+                    self.tg.send(
+                        "✅ 已记录处理: 同类 WARNING/DANGER 24h 内不再推送\n"
+                        "(CRITICAL 不受影响)\n"
+                        "若已平仓/滚仓, 可用 /journal 核对。"
+                    )
                     log.info("用户确认告警 (按类别+级别 ACK)")
                 elif callback_data == "mute_1h":
                     # 静音1小时
                     self.cooldown.signal_sent["_mute_1h"] = {
                         "signal": "MUTE", "time": now + MUTE_COOLDOWN
                     }
-                    self.tg.send("🔇 已静音1小时, 期间不再推送同类告警")
+                    self.tg.send("🔇 已静音1小时 (WARNING/DANGER); CRITICAL 仍会推送")
                     log.info("用户静音告警1h")
+                elif callback_data == "cmd_positions":
+                    self._cmd_positions()
+                elif callback_data == "cmd_hedge":
+                    self._cmd_hedge()
+                elif callback_data == "cmd_top":
+                    self._cmd_top("/top")
+                elif callback_data.startswith("opp_copy:"):
+                    short = callback_data.split(":", 1)[1]
+                    info = self.pending_opp_actions.get(short)
+                    if not info:
+                        self.tg.send("⏳ 该机会上下文已过期, 请 /top 重新查看")
+                    else:
+                        from ux_copy import order_copy_text
+                        self.tg.send(order_copy_text(
+                            info["symbol"], info["qty"], info["limit"], info["bid"]))
+                elif callback_data.startswith("opp_acted:"):
+                    short = callback_data.split(":", 1)[1]
+                    info = self.pending_opp_actions.get(short, {})
+                    symbol = info.get("symbol", short)
+                    ok = self.journal.mark_signal_acted(symbol)
+                    if ok:
+                        self.tg.send(f"✅ 已记入 journal: 按信号开仓 <code>{short}</code>")
+                    else:
+                        # 仍写入一条标记, 方便复盘
+                        self.journal.mark_signal_acted(short)
+                        self.tg.send(
+                            f"✅ 已记录开仓意图: <code>{short}</code>\n"
+                            f"(未找到原始信号记录, 仍已标记)"
+                        )
+                elif callback_data.startswith("opp_ignore:"):
+                    short = callback_data.split(":", 1)[1]
+                    info = self.pending_opp_actions.get(short, {})
+                    symbol = info.get("symbol", short)
+                    key = f"v2top:{symbol}" if symbol.startswith("BTC") else f"v2top:BTC-{short}"
+                    # 也写短名 key
+                    self.cooldown.signal_sent[key] = {"signal": "IGNORE", "time": now + 86400}
+                    self.cooldown.signal_sent[f"v2top:BTC-{short}"] = {
+                        "signal": "IGNORE", "time": now + 86400
+                    }
+                    self.tg.send(f"⏭ 已忽略 <code>{short}</code> 24 小时")
                 continue
 
             msg = update.get("message", {})
@@ -1705,7 +1622,13 @@ class MonitorService:
                 text = text.split("@")[0]
 
             if text == "/help" or text == "/start":
-                self.tg.send(self.fmt.help_msg())
+                self.tg.send(self.fmt.help_msg(self.get_bot_mode()))
+
+            elif text == "/now":
+                self._send_now()
+
+            elif text.startswith("/mode"):
+                self._cmd_mode(text)
 
             elif text == "/strategy":
                 self.tg.send(self.fmt.strategy_msg())
@@ -1717,91 +1640,32 @@ class MonitorService:
                 spot = self.last_spot or 0
                 self.tg.send(self.fmt.status_msg(
                     spot, self.scan_count, self.uptime_str(),
-                    self.last_scan_time, self.current_interval
+                    self.last_scan_time, self.current_interval,
+                    push_status=self.push_ctrl.get_status(),
+                    mode=self.get_bot_mode(),
                 ))
 
             elif text == "/scan":
-                self.tg.send("🔄 正在扫描...")
+                self.tg.send("🔄 正在扫描 (约 30–60 秒)...")
+                if not self.first_scan_started_at:
+                    self.first_scan_started_at = time.time()
                 result = self.do_scan()
-                self.send_overview(result)
+                self._send_now(result)
 
             elif text == "/positions":
-                if self.last_result:
-                    lines = []
-                    # 持仓
-                    pos = self.last_result["pos_alerts"]
-                    total_pnl = 0
-                    total_theta = 0
-                    pos_count = 0
-                    if pos:
-                        lines.append("📋 <b>当前持仓</b>\n")
-                        for p in pos:
-                            if p["type"] == "ERROR":
-                                lines.append(f"  ❌ {p['msg']}")
-                                continue
-                            icon = {"OK": "✅", "WARNING": "⚠️", "DANGER": "🔴", "WATCH": "👀"}.get(p.get("alert"), "")
-                            dte = p.get("dte", 0)
-                            theta = p.get("theta", 0)
-                            premium = p.get("premium_collected", 0)
-                            direction = p.get("direction", "Short")
-                            dir_tag = " (Long)" if direction == "Long" else ""
-                            theta_label = "进账" if theta >= 0 else "损耗"
-                            lines.append(
-                                f"{icon} <b>{p['symbol']}{dir_tag}</b>\n"
-                                f"  数量: {p['qty']}  入场: ${p['entry']:,.0f}  "
-                                f"当前: ${p['mark']:,.0f}\n"
-                                f"  盈亏: <b>${p['pnl']:+,.0f}</b> ({p['pnl_pct']:+.0f}%)  "
-                                f"距行权: {p['dist_to_strike']:.1f}%\n"
-                                f"  DTE: {dte}天  |  Theta: ${theta:.1f}/天({theta_label})"
-                                + (f"  |  权利金: ${premium:,.0f}" if premium > 0 else "")
-                                + "\n"
-                            )
-                            total_pnl += p.get("pnl", 0)
-                            total_theta += theta
-                            pos_count += 1
-                        if pos_count > 0:
-                            lines.append(
-                                f"<b>汇总:</b> 总浮盈 ${total_pnl:+,.0f}  |  "
-                                f"Theta合计 ${total_theta:+.1f}/天  |  持仓数 {pos_count}\n"
-                            )
-                    else:
-                        lines.append("📋 暂无持仓\n")
-
-                    # 挂单
-                    ords = self.last_result.get("order_alerts", [])
-                    real_ords = [o for o in ords if o.get("type") == "ORDER"]
-                    if real_ords:
-                        lines.append("📝 <b>当前挂单</b>\n")
-                        for o in real_ords:
-                            side_cn = "卖出" if o["side"] == "SELL" else "买入"
-                            if o["gap_pct"] <= 5:
-                                dist_icon = "🟢"
-                            elif o["gap_pct"] <= 15:
-                                dist_icon = "🟡"
-                            else:
-                                dist_icon = "⚪"
-                            lines.append(
-                                f"{dist_icon} <b>{o['symbol']}</b>\n"
-                                f"  {side_cn} {o['qty']}张 @ ${o['price']:,.0f}\n"
-                                f"  Bid ${o['bid']:,.0f} / Ask ${o['ask']:,.0f} / Mark ${o['mark']:,.0f}\n"
-                                f"  差距: ${o['gap']:,.0f} ({o['gap_pct']:.1f}%)\n"
-                            )
-                    else:
-                        lines.append("📝 暂无挂单")
-
-                    self.tg.send("\n".join(lines))
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描, 请稍等")
+                self._cmd_positions()
 
             elif text == "/orders":
-                if self.last_result:
+                if not self._ensure_ready():
+                    pass
+                else:
                     ords = self.last_result.get("order_alerts", [])
                     self.tg.send(self.fmt.orders_msg(ords))
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
 
             elif text == "/profit":
-                if self.last_result:
+                if not self._ensure_ready():
+                    pass
+                else:
                     # 实时计算(不用缓存, 保证最新)
                     self.tg.send("💰 正在分析...")
                     try:
@@ -1816,11 +1680,11 @@ class MonitorService:
                     except Exception as e:
                         log.error(f"收益分析失败: {e}", exc_info=True)
                         self.tg.send(f"❌ 分析失败: {e}")
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
 
             elif text == "/risk":
-                if self.last_result:
+                if not self._ensure_ready():
+                    pass
+                else:
                     risk = self.last_result.get("risk_alerts", [])
                     spot = self.last_result["data"]["spot"]
                     msg = format_risk_alerts(
@@ -1828,11 +1692,11 @@ class MonitorService:
                         risk_engine=self.risk_engine, spot=spot,
                     )
                     self.tg.send(msg)
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
 
             elif text == "/iv":
-                if self.last_result:
+                if not self._ensure_ready():
+                    pass
+                else:
                     self.tg.send("📈 正在生成 IV 图表...")
                     try:
                         from iv_chart import generate_iv_charts
@@ -1859,42 +1723,16 @@ class MonitorService:
                                          f"{s['mean']:>5.3f}  {s['min']:>5.3f}  "
                                          f"{s['max']:>5.3f}</code>")
                         self.tg.send("\n".join(lines))
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
 
             elif text == "/top" or text.startswith("/top"):
-                if self.last_result:
-                    opps = self.last_result.get("v2_opportunities", [])
-                    account = self.last_result.get("account_risk")
-                    hv = self.last_result.get("hv_20", 0)
-                    iv_mean = self.last_result["iv_surface"]["global"]["mean"]
-                    if opps and account:
-                        # 解析筛选分数: /top80, /top70 等
-                        min_score = 0
-                        cmd_num = text[4:]  # 去掉 "/top"
-                        if cmd_num.isdigit():
-                            min_score = int(cmd_num)
-                        
-                        if min_score > 0:
-                            filtered = [o for o in opps if o.score >= min_score]
-                            if filtered:
-                                msg = format_opportunities_tg(filtered, account, hv, iv_mean)
-                                header = f"🔍 <b>评分 ≥{min_score} 的机会 ({len(filtered)}个)</b>\n\n"
-                                self.tg.send(header + msg)
-                            else:
-                                self.tg.send(f"当前无评分 ≥{min_score} 的机会\n\n👉 /top 查看全部")
-                        else:
-                            msg = format_opportunities_tg(opps, account, hv, iv_mean)
-                            self.tg.send(msg)
-                    else:
-                        self.tg.send("当前无符合条件的机会")
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
+                self._cmd_top(text)
 
             elif text == "/ai":
                 if not self.ai_analyst.is_available:
                     self.tg.send("❌ AI 分析未启用 (ANTHROPIC_API_KEY 未配置)")
-                elif self.last_result:
+                elif not self._ensure_ready():
+                    pass
+                else:
                     # 优先返回缓存 (如果不到30分钟)
                     cached = self.ai_analyst.get_cached_report()
                     age = time.time() - self.ai_analyst.last_analysis_time
@@ -1924,65 +1762,15 @@ class MonitorService:
                                 self.tg.send(report)
                         else:
                             self.tg.send("❌ AI 分析失败，请查看日志")
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
 
             elif text == "/overview":
-                if self.last_result:
-                    self.send_overview(self.last_result)
+                if not self._ensure_ready():
+                    pass
                 else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
+                    self.send_overview(self.last_result)
 
             elif text == "/hedge":
-                if self.last_result and self.last_pos_list:
-                    self.tg.send("🛡️ 计算对冲方案...")
-                    try:
-                        spot = self.last_result["data"]["spot"]
-                        from binance_options import get_account_equity
-                        _acct = get_account_equity(self.api)
-                        balance = _acct["margin_balance"]
-
-                        if balance <= 0:
-                            self.tg.send("❌ 无法获取账户余额")
-                        else:
-                            available_puts = self._get_hedge_candidates(self.last_result["data"])
-                            hedge_calc = self.hedge_advisor.calc_hedge_options(
-                                self.last_pos_list, spot, balance, available_puts)
-
-                            liq = hedge_calc["liq_current"]
-                            lines = ["🛡️ <b>对冲方案</b>\n"]
-                            lines.append(f"BTC ${spot:,.0f}  余额 ${balance:,.0f}")
-                            lines.append(f"强平价 ${liq['liq_price']:,.0f} (跌 {abs(liq['liq_drop_pct']):.0f}%)")
-                            lines.append(f"模式: {self.risk_mode.mode_icon}\n")
-
-                            # 补保证金 vs 买 Put
-                            comp = hedge_calc.get("comparison", {})
-                            if comp:
-                                lines.append("<b>$1,000 对比:</b>")
-                                lines.append(f"  补保证金 → 下移 ${comp['cash_1k_improve']:,.0f}")
-                                lines.append(f"  买 Put   → 下移 ${comp['best_put_1k_improve']:,.0f}")
-                                lines.append(f"  效率: 买Put = <b>{comp['ratio']:.0f}x</b>\n")
-
-                            # 各预算最优
-                            best = hedge_calc.get("best_by_budget", {})
-                            if best:
-                                lines.append("<b>推荐方案:</b>")
-                                for budget in [500, 1000, 2000, 3000]:
-                                    b = best.get(budget)
-                                    if not b:
-                                        continue
-                                    short_sym = b["symbol"].split("BTC-")[-1]
-                                    lines.append(
-                                        f"  ${budget:,}: {short_sym} ×{b['qty']:.1f}张"
-                                        f" @ ${b['ask']:,.0f}"
-                                        f" → 强平 ${b['liq_price']:,.0f}"
-                                        f" (跌{abs(b['liq_drop']):.0f}%)"
-                                    )
-                            self.tg.send("\n".join(lines))
-                    except Exception as e:
-                        self.tg.send(f"❌ 对冲计算失败: {e}")
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
+                self._cmd_hedge()
 
             elif text == "/config":
                 self._cmd_config()
@@ -1991,7 +1779,9 @@ class MonitorService:
                 self._cmd_set(text)
 
             elif text == "/payoff":
-                if self.last_result:
+                if not self._ensure_ready():
+                    pass
+                else:
                     self.tg.send("📈 正在生成 Payoff 图...")
                     try:
                         pos_alerts = self.last_result.get("pos_alerts", [])
@@ -2046,8 +1836,6 @@ class MonitorService:
                     except Exception as e:
                         log.error(f"Payoff 图生成失败: {e}", exc_info=True)
                         self.tg.send(f"❌ Payoff 图生成失败: {e}")
-                else:
-                    self.tg.send("⏳ 尚未完成首次扫描")
 
             elif text == "/map":
                 try:
@@ -2111,6 +1899,295 @@ class MonitorService:
                             f"{hit['acted_on']}条入场 ({hit['hit_rate']:.0f}%)"
                         )
                     self.tg.send("\n".join(lines))
+
+    # --- UX helpers ---
+    def _ensure_ready(self) -> bool:
+        """冷启动提示: 未完成首次扫描时给可预期等待文案"""
+        if self.last_result:
+            return True
+        elapsed = 0
+        if self.first_scan_started_at:
+            elapsed = int(time.time() - self.first_scan_started_at)
+        tip = "通常 30–60 秒"
+        if elapsed > 0:
+            tip = f"已等待 {elapsed}s, 通常总计 30–60 秒"
+        self.tg.send(
+            f"⏳ 首次扫描尚未完成 ({tip})。\n"
+            f"完成后 /now 可用; 也可发 /scan 强制刷新。"
+        )
+        return False
+
+    def _build_now_snapshot(self, result: dict = None) -> dict:
+        """构建 /now 决策快照"""
+        result = result or self.last_result
+        push = self.push_ctrl.get_status()
+        snap = {
+            "ready": bool(result),
+            "mode": self.get_bot_mode(),
+            "score_push": get_runtime_param("score_push", ScanConfig.SCORE_PUSH),
+            "push_used": push.get("daily_signal_count", 0),
+            "push_limit": push.get("daily_limit", 5),
+            "push_suppressed": push.get("suppressed_today", 0),
+        }
+        if not result:
+            return snap
+
+        spot = result.get("data", {}).get("spot") or self.last_spot or 0
+        snap["spot"] = spot
+
+        change_pct = None
+        try:
+            ch = self.risk_engine.price_tracker.get_change_pct(86400)
+            if ch != 0:
+                change_pct = ch
+        except Exception:
+            pass
+        snap["change_pct"] = change_pct
+
+        pos = result.get("pos_alerts") or []
+        real_pos = [p for p in pos if p.get("type") != "ERROR" and p.get("qty", 0) != 0]
+        # type may be missing; accept any with pnl
+        if not real_pos:
+            real_pos = [p for p in pos if "pnl" in p and p.get("type") != "ERROR"]
+
+        snap["pos_count"] = len(real_pos)
+        snap["total_pnl"] = sum(p.get("pnl", 0) for p in real_pos)
+        dists = [p.get("dist_to_strike") for p in real_pos
+                 if p.get("dist_to_strike") is not None]
+        snap["nearest_dist"] = min(dists) if dists else None
+
+        rank = {"CRITICAL": 4, "DANGER": 3, "WARNING": 2, "WATCH": 1, "OK": 0}
+        worst = "OK"
+        for p in real_pos:
+            a = p.get("alert", "OK")
+            if rank.get(a, 0) > rank.get(worst, 0):
+                worst = a
+        for a in result.get("risk_alerts") or []:
+            lvl = getattr(a, "level", None) or (a.get("level") if isinstance(a, dict) else None)
+            if lvl and rank.get(lvl, 0) > rank.get(worst, 0):
+                worst = lvl
+        snap["worst_alert"] = worst
+
+        liq_drop = None
+        try:
+            if getattr(self.hedge_advisor, "last_liq_drop", 0):
+                liq_drop = self.hedge_advisor.last_liq_drop
+        except Exception:
+            pass
+        snap["liq_drop_pct"] = liq_drop
+
+        opps = result.get("v2_opportunities") or []
+        push_score = snap["score_push"]
+        openable = [o for o in opps if getattr(o, "can_open", False)
+                    and getattr(o, "score", 0) >= push_score]
+        if openable:
+            best = max(openable, key=lambda o: o.score)
+            snap["best_opp"] = {
+                "symbol": best.symbol,
+                "score": best.score,
+                "bid": best.bid,
+                "safety_pct": best.safety_pct,
+            }
+        else:
+            snap["best_opp"] = None
+
+        # 下一步一句话
+        if worst in ("CRITICAL", "DANGER"):
+            snap["next_action"] = "处理风险持仓 → /positions 或 /hedge"
+        elif snap["best_opp"]:
+            snap["next_action"] = "考虑开仓 → 看推送操作卡或 /top"
+        elif snap["pos_count"] > 0:
+            snap["next_action"] = "持有观察 · /profit 看止盈"
+        else:
+            snap["next_action"] = "继续等待好机会 (安静是正确的)"
+        return snap
+
+    def _send_now(self, result: dict = None):
+        from ux_copy import build_now_message
+        snap = self._build_now_snapshot(result)
+        self.tg.send(build_now_message(snap))
+
+    def _cmd_mode(self, text: str):
+        from ux_copy import mode_help
+        parts = text.split()
+        if len(parts) == 1:
+            self.tg.send(mode_help(self.get_bot_mode()))
+            return
+        new_mode = parts[1].strip().lower()
+        if new_mode not in VALID_BOT_MODES:
+            self.tg.send(mode_help(self.get_bot_mode()))
+            return
+        runtime_config["bot_mode"] = new_mode
+        try:
+            self.state.save_runtime_config(runtime_config)
+            self.state.save(force=True)
+        except Exception as e:
+            log.warning(f"保存 bot_mode 失败: {e}")
+        labels = {
+            "hunt": "猎机: 正常推机会+风控",
+            "hold": "持仓: 抑制新开仓机会, 保留风控",
+            "quiet": "安静: 仅 CRITICAL + 日报",
+        }
+        self.tg.send(f"✅ 模式已切换为 <b>{new_mode}</b>\n{labels[new_mode]}")
+
+    def _cmd_positions(self):
+        if not self._ensure_ready():
+            return
+        lines = []
+        pos = self.last_result["pos_alerts"]
+        total_pnl = 0
+        total_theta = 0
+        pos_count = 0
+        if pos:
+            lines.append("📋 <b>当前持仓</b>\n")
+            for p in pos:
+                if p.get("type") == "ERROR":
+                    lines.append(f"  ❌ {p['msg']}")
+                    continue
+                if "pnl" not in p and p.get("type") not in (None, "POSITION"):
+                    continue
+                icon = {"OK": "✅", "WARNING": "⚠️", "DANGER": "🔴", "WATCH": "👀"}.get(
+                    p.get("alert"), "")
+                dte = p.get("dte", 0)
+                theta = p.get("theta", 0)
+                premium = p.get("premium_collected", 0)
+                direction = p.get("direction", "Short")
+                dir_tag = " (Long)" if direction == "Long" else ""
+                theta_label = "进账" if theta >= 0 else "损耗"
+                lines.append(
+                    f"{icon} <b>{p.get('symbol', '?')}{dir_tag}</b>\n"
+                    f"  数量: {p.get('qty', 0)}  入场: ${p.get('entry', 0):,.0f}  "
+                    f"当前: ${p.get('mark', 0):,.0f}\n"
+                    f"  盈亏: <b>${p.get('pnl', 0):+,.0f}</b> ({p.get('pnl_pct', 0):+.0f}%)  "
+                    f"距行权: {p.get('dist_to_strike', 0):.1f}%\n"
+                    f"  DTE: {dte}天  |  Theta: ${theta:.1f}/天({theta_label})"
+                    + (f"  |  权利金: ${premium:,.0f}" if premium > 0 else "")
+                    + "\n"
+                )
+                total_pnl += p.get("pnl", 0)
+                total_theta += theta
+                pos_count += 1
+            if pos_count > 0:
+                lines.append(
+                    f"<b>汇总:</b> 总浮盈 ${total_pnl:+,.0f}  |  "
+                    f"Theta合计 ${total_theta:+.1f}/天  |  持仓数 {pos_count}\n"
+                )
+        else:
+            lines.append("📋 暂无持仓\n")
+
+        ords = self.last_result.get("order_alerts", [])
+        real_ords = [o for o in ords if o.get("type") == "ORDER"]
+        if real_ords:
+            lines.append("📝 <b>当前挂单</b>\n")
+            for o in real_ords:
+                side_cn = "卖出" if o["side"] == "SELL" else "买入"
+                if o["gap_pct"] <= 5:
+                    dist_icon = "🟢"
+                elif o["gap_pct"] <= 15:
+                    dist_icon = "🟡"
+                else:
+                    dist_icon = "⚪"
+                lines.append(
+                    f"{dist_icon} <b>{o['symbol']}</b>\n"
+                    f"  {side_cn} {o['qty']}张 @ ${o['price']:,.0f}\n"
+                    f"  Bid ${o['bid']:,.0f} / Ask ${o['ask']:,.0f} / Mark ${o['mark']:,.0f}\n"
+                    f"  差距: ${o['gap']:,.0f} ({o['gap_pct']:.1f}%)\n"
+                )
+        else:
+            lines.append("📝 暂无挂单")
+
+        self.tg.send("\n".join(lines))
+
+    def _cmd_top(self, text: str):
+        if not self._ensure_ready():
+            return
+        opps = self.last_result.get("v2_opportunities", [])
+        account = self.last_result.get("account_risk")
+        hv = self.last_result.get("hv_20", 0)
+        iv_mean = self.last_result["iv_surface"]["global"]["mean"]
+        if not opps or not account:
+            self.tg.send("当前无符合条件的机会")
+            return
+
+        suffix = text[4:].strip()  # after /top
+        if suffix == "all":
+            msg = format_opportunities_tg(opps, account, hv, iv_mean,
+                                          openable_only=False)
+            self.tg.send(msg)
+            return
+
+        min_score = 0
+        if suffix.isdigit():
+            min_score = int(suffix)
+
+        if min_score > 0:
+            filtered = [o for o in opps if o.score >= min_score]
+            if filtered:
+                msg = format_opportunities_tg(
+                    filtered, account, hv, iv_mean, openable_only=True)
+                header = f"🔍 <b>评分 ≥{min_score} 可开仓 ({len([o for o in filtered if o.can_open])}个)</b>\n\n"
+                self.tg.send(header + msg)
+            else:
+                self.tg.send(
+                    f"当前无评分 ≥{min_score} 的机会\n\n"
+                    f"👉 /top 看可开 · /top all 看全部"
+                )
+        else:
+            msg = format_opportunities_tg(
+                opps, account, hv, iv_mean, openable_only=True)
+            self.tg.send(msg)
+
+    def _cmd_hedge(self):
+        if not self._ensure_ready():
+            return
+        if not self.last_pos_list:
+            self.tg.send("📋 当前无持仓, 无需对冲")
+            return
+        self.tg.send("🛡️ 计算对冲方案...")
+        try:
+            spot = self.last_result["data"]["spot"]
+            from binance_options import get_account_equity
+            _acct = get_account_equity(self.api)
+            balance = _acct["margin_balance"]
+
+            if balance <= 0:
+                self.tg.send("❌ 无法获取账户余额")
+                return
+
+            available_puts = self._get_hedge_candidates(self.last_result["data"])
+            hedge_calc = self.hedge_advisor.calc_hedge_options(
+                self.last_pos_list, spot, balance, available_puts)
+
+            liq = hedge_calc["liq_current"]
+            lines = ["🛡️ <b>对冲方案</b>\n"]
+            lines.append(f"BTC ${spot:,.0f}  余额 ${balance:,.0f}")
+            lines.append(f"强平价 ${liq['liq_price']:,.0f} (跌 {abs(liq['liq_drop_pct']):.0f}%)")
+            lines.append(f"模式: {self.risk_mode.mode_icon}\n")
+
+            comp = hedge_calc.get("comparison", {})
+            if comp:
+                lines.append("<b>$1,000 对比:</b>")
+                lines.append(f"  补保证金 → 下移 ${comp['cash_1k_improve']:,.0f}")
+                lines.append(f"  买 Put   → 下移 ${comp['best_put_1k_improve']:,.0f}")
+                lines.append(f"  效率: 买Put = <b>{comp['ratio']:.0f}x</b>\n")
+
+            best = hedge_calc.get("best_by_budget", {})
+            if best:
+                lines.append("<b>推荐方案:</b>")
+                for budget in [500, 1000, 2000, 3000]:
+                    b = best.get(budget)
+                    if not b:
+                        continue
+                    short_sym = b["symbol"].split("BTC-")[-1]
+                    lines.append(
+                        f"  ${budget:,}: {short_sym} ×{b['qty']:.1f}张"
+                        f" @ ${b['ask']:,.0f}"
+                        f" → 强平 ${b['liq_price']:,.0f}"
+                        f" (跌{abs(b['liq_drop']):.0f}%)"
+                    )
+            self.tg.send("\n".join(lines))
+        except Exception as e:
+            self.tg.send(f"❌ 对冲计算失败: {e}")
 
     # --- P2-3: /config & /set 命令 ---
     def _cmd_config(self):
@@ -2509,9 +2586,12 @@ class MonitorService:
         self.tg.broadcast(
             "🟢 <b>监控 Bot 已启动</b>\n\n"
             f"扫描间隔: {SCAN_INTERVAL_NORMAL}s (常规) / {SCAN_INTERVAL_VOLATILE}s (波动)\n"
-            f"概览推送: 每{OVERVIEW_INTERVAL // 3600}小时\n\n"
-            "发送 /help 查看可用命令"
+            f"概览推送: 每{OVERVIEW_INTERVAL // 3600}小时\n"
+            f"模式: {self.get_bot_mode()}\n\n"
+            "发送 /now 看决策首页 · /help 看命令"
         )
+
+        self.first_scan_started_at = time.time()
 
         # 用日 K 线初始化日开盘价 (避免重启后失真)
         self.risk_engine.price_tracker.init_daily_open_from_kline()

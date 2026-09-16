@@ -62,6 +62,15 @@ class HedgeAdvisor:
         self.last_hedge_push = 0
         self.last_expiry_warn = {}  # {symbol: timestamp}
 
+    def get_last_liquidation(self) -> dict:
+        """返回最近一次强平估算 (供图表/告警附图使用)"""
+        if not self.last_liq_price:
+            return {}
+        return {
+            "liq_price": self.last_liq_price,
+            "liq_drop_pct": self.last_liq_drop,
+        }
+
     def update_liquidation(self, pos_list: list, spot: float,
                            account_balance: float) -> dict:
         """

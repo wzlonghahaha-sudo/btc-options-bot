@@ -1,5 +1,18 @@
 # CHANGELOG — BTC Options Bot 全面改进
 
+## UX 交互优化 (2026-09-16)
+
+- 新增 `/now` 一屏决策首页 (价格/持仓风险/最佳机会/推送预算/下一步)
+- `/help` `/rules` `/strategy` 改由 `ux_copy.py` 从 ScanConfig/risk_rules 实时生成, 消除口径不一致
+- 机会推送增加 Inline 按钮: 下单要点 / 已开仓记入 / 忽略24h / 更多机会
+- 告警按钮拆分: 已处理 / 稍后静音 / 看持仓 / 对冲
+- `/top` 默认仅可开仓; `/top all` 看全部; `/mode hunt|hold|quiet` 情境推送
+- `/scan` 结束后刷新 `/now`; 冷启动提示改为可预期等待
+- `/status` 展示今日推送预算; journal 支持按钮标记已开仓
+- 测试: `tests/test_ux.py` (11) + 既有套件共 77 passed
+
+---
+
 生成时间: 2026-07-06  
 总 commit: 23 个 (P0×13 + P1×6 + P2×4)  
 pytest: **30/30 passed** (0.02s)  

@@ -146,6 +146,24 @@ class TradeJournal:
         self.save()
         log.info(f"记录信号: {signal.symbol} {signal.signal_level} score={signal.score:.0f}")
 
+    def mark_signal_acted(self, symbol: str) -> bool:
+        """
+        用户从推送按钮标记「已开仓」。
+        匹配完整 symbol 或短名 (如 27JUN-72000P)。
+        """
+        signals = self.data.get("signals", [])
+        now = time.time()
+        for sig in reversed(signals):
+            sym = sig.get("symbol", "")
+            short = sym.split("BTC-")[-1] if "BTC-" in sym else sym
+            if sym == symbol or short == symbol or sym.endswith(symbol):
+                sig["user_acted"] = True
+                sig["user_acted_at"] = now
+                self.save()
+                log.info(f"用户标记已开仓: {sym}")
+                return True
+        return False
+
     # --- 持仓变化检测 ---
     def check_position_changes(self, current_positions: list, spot: float) -> list[dict]:
         """
@@ -502,6 +520,9 @@ class TradeJournal:
         acted = 0
 
         for sig in signals:
+            if sig.get("user_acted"):
+                acted += 1
+                continue
             sig_sym = sig.get("symbol", "")
             sig_time = sig.get("timestamp", 0)
             # 信号发出后 24 小时内是否有该合约的入场
