@@ -566,19 +566,29 @@ def scan_all_opportunities(data: dict, iv_surface: dict, account: AccountRisk,
 # ============================================================
 def format_opportunities_tg(opps: list, account: AccountRisk,
                             hv_20: float, iv_mean: float,
-                            push_mode: bool = False) -> str:
+                            push_mode: bool = False,
+                            openable_only: bool = False,
+                            max_per_tier: int = 0) -> str:
     """
     格式化机会推送
 
     push_mode=True: 只推送 score >= SIGNAL 的机会, 精简格式
-    push_mode=False: /top 命令, 展示全部
+    push_mode=False: /top 命令展示
+    openable_only=True: 仅 can_open 且 score>=SIGNAL (默认 /top 行为)
+    max_per_tier: >0 时覆盖每档展示条数
     """
     cfg = ScanConfig()
     lines = []
 
+    if openable_only:
+        opps = [o for o in opps if o.can_open and o.score >= cfg.SCORE_SIGNAL]
+
     if not push_mode:
         # 完整版: 先展示账户概况
-        lines.append("🔍 <b>机会扫描报告</b>")
+        title = "🔍 <b>可开仓机会</b>" if openable_only else "🔍 <b>机会扫描报告</b>"
+        lines.append(title)
+        if openable_only:
+            lines.append("<i>默认仅可开仓 · /top all 看全部</i>")
         lines.append("")
         lines.append("<b>📊 账户 & 市场</b>")
         lines.append(f"  资金: ${account.total_balance:,.0f}  "
@@ -596,7 +606,6 @@ def format_opportunities_tg(opps: list, account: AccountRisk,
     tiers = {"conservative": [], "balanced": [], "aggressive": []}
     for o in opps:
         tiers[o.tier].append(o)
-
     for tier_name in ["balanced", "conservative", "aggressive"]:
         tier_opps = tiers[tier_name]
         if not tier_opps:
@@ -611,7 +620,10 @@ def format_opportunities_tg(opps: list, account: AccountRisk,
         lines.append(f"<b>{tier_cfg['label']} ({tier_cfg['desc']})</b>")
         lines.append("")
 
-        display_count = 3 if push_mode else 5
+        if max_per_tier > 0:
+            display_count = max_per_tier
+        else:
+            display_count = 3 if (push_mode or openable_only) else 5
         for o in tier_opps[:display_count]:
             _format_one_opportunity(lines, o, push_mode)
 
@@ -620,7 +632,11 @@ def format_opportunities_tg(opps: list, account: AccountRisk,
             lines.append(f"  ... 还有 {remaining} 个\n")
 
     if not push_mode and not any(tiers.values()):
-        lines.append("当前无符合条件的机会")
+        if openable_only:
+            lines.append("当前无「可开仓」机会")
+            lines.append("👉 /top all 查看全部候选")
+        else:
+            lines.append("当前无符合条件的机会")
 
     # 汇总
     total = len(opps)
