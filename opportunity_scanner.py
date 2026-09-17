@@ -132,14 +132,16 @@ def assess_account_risk(api, data: dict) -> AccountRisk:
         vega = float(m.get("vega", 0))
         theta = float(m.get("theta", 0))
 
-        # 保证金估算 (统一公式)
-        margin = calc_put_margin(spot, strike, abs_qty)
-
-        # 卖 Put: delta 为负, qty 为负, 组合 delta = delta * |qty| (正数=看多暴露)
+        # 保证金: 仅空头收取 short-put IM; 多头按权利金占用 (debit premium)
         if qty < 0:
-            pos_delta = abs(delta) * abs_qty  # 卖 Put 的等效多头暴露
+            margin = calc_put_margin(spot, strike, abs_qty)
+            # 卖 Put: delta 为负, qty 为负, 组合 delta = |delta| * |qty| (正数=看多暴露)
+            pos_delta = abs(delta) * abs_qty
             pnl = (entry - mark_price) * abs_qty
         else:
+            # long: 不收 short-put IM, margin = 权利金暴露
+            px = mark_price if mark_price > 0 else entry
+            margin = abs_qty * px
             pos_delta = delta * abs_qty
             pnl = (mark_price - entry) * abs_qty
 

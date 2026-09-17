@@ -31,6 +31,7 @@
 
 import sys
 import os
+from pathlib import Path
 import time
 import json
 import math
@@ -105,7 +106,9 @@ class Config:
 class IVTracker:
     """追踪 IV 历史, 计算 IV percentile 和趋势"""
 
-    def __init__(self, history_file: str = "/root/projects/iv_history.json"):
+    def __init__(self, history_file: str = None):
+        if history_file is None:
+            history_file = str(Path(__file__).resolve().parent / "data" / "iv_history.json")
         self.history_file = history_file
         self.history = self._load()
 

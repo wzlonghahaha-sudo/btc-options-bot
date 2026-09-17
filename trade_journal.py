@@ -11,6 +11,7 @@
 """
 
 import os
+from pathlib import Path
 import json
 import time
 import logging
@@ -20,7 +21,7 @@ from typing import Optional
 
 log = logging.getLogger("trade_journal")
 
-JOURNAL_FILE = "/root/projects/trade_journal.json"
+JOURNAL_FILE = str(Path(__file__).resolve().parent / "data" / "trade_journal.json")
 
 
 # ============================================================
