@@ -13,6 +13,7 @@ IV 曲面可视化 + 市场解读
 """
 
 import os
+from pathlib import Path
 import logging
 import matplotlib
 matplotlib.use("Agg")  # 无头模式
@@ -46,7 +47,7 @@ def setup_font():
 
 setup_font()
 
-CHART_DIR = "/root/projects/charts"
+CHART_DIR = str(Path(__file__).resolve().parent / "data" / "charts")
 os.makedirs(CHART_DIR, exist_ok=True)
 
 

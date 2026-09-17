@@ -901,6 +901,7 @@ class MonitorService:
         self.current_interval = SCAN_INTERVAL_NORMAL
         self.last_result = None
         self.last_pos_list = []  # 压力测试用的持仓列表
+        self._last_capital_warn_ts = 0  # TG 资金偏低预警限频 (6h)
 
         self.running = True
         self.update_offset = 0
@@ -1043,6 +1044,23 @@ class MonitorService:
         account_balance = acct_info["margin_balance"]
         if account_balance <= 0 and account_risk:
             account_balance = account_risk.available_margin + account_risk.used_margin
+
+        # 资金偏低预警 (相对典型 short-put IM, 6h 限频)
+        try:
+            equity = 0.0
+            if account_risk is not None:
+                equity = float(getattr(account_risk, "total_balance", 0) or 0)
+            if equity <= 0:
+                equity = float(acct_info.get("equity", 0) or 0)
+            if equity <= 0:
+                equity = float(acct_info.get("margin_balance", 0) or 0)
+            self._maybe_warn_low_capital(
+                equity=equity,
+                spot=float(data.get("spot", 0) or 0),
+                v2_opps=v2_opportunities,
+            )
+        except Exception as e:
+            log.warning(f"资金偏低预警检查失败: {e}")
 
         try:
             positions = self.api.get_position()
@@ -2364,6 +2382,48 @@ class MonitorService:
         except Exception as e:
             log.warning(f"Heartbeat ping failed: {e}")
 
+    def _maybe_warn_low_capital(self, equity: float, spot: float, v2_opps) -> None:
+        """权益过低无法覆盖典型 short-put IM 时发 TG 预警 (最多每 6 小时一次)。"""
+        now = time.time()
+        if now - float(getattr(self, "_last_capital_warn_ts", 0) or 0) < 6 * 3600:
+            return
+
+        typical_im = 7600.0
+        try:
+            margins = [
+                float(o.margin_required)
+                for o in (v2_opps or [])
+                if getattr(o, "margin_required", 0)
+            ]
+            if margins:
+                import statistics
+                typical_im = float(statistics.median(margins))
+            elif spot and spot > 0:
+                from margin_calc import calc_put_margin_per_contract
+                typical_im = float(calc_put_margin_per_contract(spot, spot * 0.85))
+        except Exception as e:
+            log.debug(f"典型 IM 估算失败, 使用 fallback: {e}")
+
+        if equity <= 0 or equity >= 1.5 * typical_im:
+            return
+
+        self._last_capital_warn_ts = now
+        msg = (
+            f"⚠️ <b>账户资金偏低</b>\n\n"
+            f"当前权益约 ${equity:,.0f}，开一张典型 short put 约需保证金 "
+            f"${typical_im:,.0f}（阈值 1.5× ≈ ${1.5 * typical_im:,.0f}）。\n"
+            f"权益不足，can_open 将持续被拦截。\n"
+            f"扫描与告警会继续，但新开仓将被风控阻止。"
+        )
+        try:
+            self.tg.broadcast(msg)
+            log.warning(
+                f"资金偏低预警已推送: equity=${equity:,.0f} "
+                f"typical_im=${typical_im:,.0f}"
+            )
+        except Exception as e:
+            log.warning(f"资金偏低预警推送失败: {e}")
+
     # --- 扫描线程 ---
     def _scan_loop(self):
         """独立线程: 按间隔扫描市场"""
@@ -2399,8 +2459,19 @@ class MonitorService:
                 spot = result["data"]["spot"]
                 n_strong = len([r for r in result["results"] if r["signal"] == "STRONG"])
                 n_signal = len([r for r in result["results"] if r["signal"] == "SIGNAL"])
-                log.info(f"扫描 #{self.scan_count}: BTC ${spot:,.0f} | "
-                         f"强:{n_strong} 信号:{n_signal} | {result['scan_time']:.1f}s")
+                v2 = result.get("v2_opportunities") or []
+                v2_sig = len([o for o in v2 if o.score >= ScanConfig.SCORE_SIGNAL])
+                v2_strong = len([o for o in v2 if o.score >= ScanConfig.SCORE_STRONG])
+                v2_push = len([o for o in v2 if o.score >= ScanConfig.SCORE_PUSH])
+                v2_can = len([o for o in v2 if getattr(o, "can_open", False)])
+                v2_max = max((o.score for o in v2), default=0)
+                log.info(
+                    f"扫描 #{self.scan_count}: BTC ${spot:,.0f} | "
+                    f"v1强:{n_strong} 信号:{n_signal} | "
+                    f"v2信号:{v2_sig} 强:{v2_strong} 推送:{v2_push} "
+                    f"can_open:{v2_can} max:{v2_max:.0f} | "
+                    f"{result['scan_time']:.1f}s"
+                )
 
                 # 处理信号推送
                 self.process_signals(result["results"], spot)

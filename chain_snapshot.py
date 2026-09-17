@@ -44,7 +44,9 @@ def save_chain_snapshot(data: dict) -> bool:
 
     try:
         spot = data.get("spot", 0)
-        ts = data.get("timestamp", time.time())
+        ts_raw = data.get("timestamp", time.time())
+        # fetch_market_data 使用毫秒时间戳; fromtimestamp 需要秒
+        ts = float(ts_raw) / 1000.0 if float(ts_raw) > 1e12 else float(ts_raw)
         marks = data.get("marks", {})
         tickers = data.get("tickers", {})
 

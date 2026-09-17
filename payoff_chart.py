@@ -8,6 +8,7 @@
 """
 
 import os
+from pathlib import Path
 import logging
 import numpy as np
 import matplotlib
@@ -17,7 +18,7 @@ import matplotlib.ticker as mticker
 
 log = logging.getLogger("payoff_chart")
 
-CHART_DIR = "/root/projects/charts"
+CHART_DIR = str(Path(__file__).resolve().parent / "data" / "charts")
 os.makedirs(CHART_DIR, exist_ok=True)
 
 # 复用 iv_chart 的暗色主题
