@@ -110,7 +110,9 @@ sleep 1
 
 # ---- 6. 启动 Bot ----
 echo "[启动] BTC Put Monitor Bot..."
-nohup python3 "$SCRIPT_DIR/tg_bot_monitor.py" >> "$LOG_FILE" 2>&1 &
+PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
+if [ ! -x "$PYTHON_BIN" ]; then PYTHON_BIN=python3; fi
+nohup "$PYTHON_BIN" "$SCRIPT_DIR/tg_bot_monitor.py" >> "$LOG_FILE" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
 
@@ -118,6 +120,25 @@ echo "$NEW_PID" > "$PID_FILE"
 sleep 5
 if kill -0 "$NEW_PID" 2>/dev/null; then
     echo "[启动] Bot 已启动 (PID: $NEW_PID) ✅"
+
+# start proxy failover watchdog
+if [ -x "$SCRIPT_DIR/proxy/proxy_watchdog.sh" ]; then
+  if [ -f "$SCRIPT_DIR/proxy/proxy_watchdog.pid" ]; then
+    _ppid=$(tr -cd "0-9" < "$SCRIPT_DIR/proxy/proxy_watchdog.pid")
+    if [ -n "$_ppid" ] && kill -0 "$_ppid" 2>/dev/null; then
+      echo "[检查] proxy watchdog: 已运行 (PID: $_ppid) ✅"
+    else
+      nohup "$SCRIPT_DIR/proxy/proxy_watchdog.sh" >> "$SCRIPT_DIR/proxy/failover_watchdog.log" 2>&1 &
+      echo $! > "$SCRIPT_DIR/proxy/proxy_watchdog.pid"
+      echo "[启动] proxy watchdog (PID: $!) ✅"
+    fi
+  else
+    nohup "$SCRIPT_DIR/proxy/proxy_watchdog.sh" >> "$SCRIPT_DIR/proxy/failover_watchdog.log" 2>&1 &
+    echo $! > "$SCRIPT_DIR/proxy/proxy_watchdog.pid"
+    echo "[启动] proxy watchdog (PID: $!) ✅"
+  fi
+fi
+
 else
     echo "[错误] Bot 启动失败! 查看日志:"
     tail -20 "$LOG_FILE"

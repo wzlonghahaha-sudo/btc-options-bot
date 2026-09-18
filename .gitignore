@@ -18,6 +18,13 @@ __pycache__/
 watchdog.log
 watchdog.pid
 
+# Proxy failover runtime (logs/pids/generated configs; never commit)
+proxy/*.log
+proxy/*.pid
+proxy/sing-box.log
+proxy/failover.log
+proxy/failover_watchdog.log
+
 # 其他项目和无关文件 — 本仓库只包含 btc-options-bot 本体
 cerebras-ipo-monitor/
 vc-daily-report/

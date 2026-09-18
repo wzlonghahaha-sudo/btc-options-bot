@@ -35,3 +35,20 @@ fi
 pkill -f "tg_bot_monitor.py" 2>/dev/null || true
 
 echo "Bot + Watchdog 已停止"
+
+# Stop proxy failover watchdog (optional companion)
+if [ -f "$SCRIPT_DIR/proxy/proxy_watchdog.pid" ]; then
+  _ppid=$(tr -cd "0-9" < "$SCRIPT_DIR/proxy/proxy_watchdog.pid")
+  if [ -n "$_ppid" ] && kill -0 "$_ppid" 2>/dev/null; then
+    kill "$_ppid" 2>/dev/null || true
+  fi
+  rm -f "$SCRIPT_DIR/proxy/proxy_watchdog.pid"
+fi
+if [ -f "$SCRIPT_DIR/proxy/failover_watch.pid" ]; then
+  _fpid=$(tr -cd "0-9" < "$SCRIPT_DIR/proxy/failover_watch.pid")
+  if [ -n "$_fpid" ] && kill -0 "$_fpid" 2>/dev/null; then
+    kill "$_fpid" 2>/dev/null || true
+  fi
+  rm -f "$SCRIPT_DIR/proxy/failover_watch.pid"
+fi
+
