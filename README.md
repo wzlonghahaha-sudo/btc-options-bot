@@ -40,15 +40,17 @@
 | 状态持久化 | `state_persistence.py` | 运行时状态 JSON 持久化, 重启不丢失 |
 | 事件日历 | `event_calendar.py` | 宏观经济事件 (FOMC/CPI/非农) 对开仓评分的影响 |
 | AI 分析 | `ai_analyst.py` | LLM 驱动的市场判断 + 持仓评价 + 开仓点评 |
+| Proxy failover | `proxy/proxy_failover.py` | 本地 sing-box 节点健康检查与自动切换 (Binance eAPI) |
 
 ## 部署步骤
 
 1. Clone repo
 2. Copy `.env.example` to `.env`, fill in API keys
 3. `pip install -r requirements.txt`
-4. `./start_bot.sh`
+4. `./start_bot.sh` (also starts local proxy failover watchdog if `proxy/proxy_watchdog.sh` is present)
 5. (Optional) Set up `bot_watchdog.sh` in crontab
 6. (Optional) Set up `HEARTBEAT_URL` for external monitoring
+7. (Optional) Binance local-proxy failover: set `BINANCE_PROXY_URL` in `.env` (subscription URL, never commit). See `proxy/README.md`. Health-checks eAPI via `127.0.0.1:7890`; after 2 consecutive fails, refreshes the subscription, probes nodes, pins the first HTTP 200, restarts sing-box.
 
 ## TG 命令列表
 
