@@ -40,6 +40,7 @@ agents.md
 *.json
 !.env.example
 !package.json
+!.cursor/environment.json
 credentials*.json
 token.json
 oauth_state.json
